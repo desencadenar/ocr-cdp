@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "OCR CDP: abrir la ventana",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/iniciar.py",
+      "args": ["ui"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "OCR CDP: analizar una carpeta",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/iniciar.py",
+      "args": ["scan", "--input", "${input:carpetaEntrada}", "--output", "${input:carpetaSalida}", "--recipient-ruc", "${input:rucReceptor}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {"id": "carpetaEntrada", "type": "promptString", "description": "Carpeta con los comprobantes"},
+    {"id": "carpetaSalida", "type": "promptString", "description": "Carpeta de salida (vacía y fuera de la de entrada)"},
+    {"id": "rucReceptor", "type": "promptString", "description": "RUC del comprador que quieres contrastar"}
+  ]
+}

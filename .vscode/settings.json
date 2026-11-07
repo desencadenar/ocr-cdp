@@ -1,0 +1,5 @@
+{
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "python.analysis.extraPaths": ["${workspaceFolder}/src"]
+}

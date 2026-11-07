@@ -1,0 +1,11 @@
+{
+  "ruta_tesseract": "auto",
+  "idiomas_ocr": "spa+eng",
+  "segundos_por_pagina": 90,
+  "umbral_confianza_ocr": 70,
+  "resolucion_pdf": 220,
+  "maximo_pixeles": 40000000,
+  "releer_recuadro_importes": false,
+  "revisar_archivos_zip": true,
+  "padron_ruc": null
+}
