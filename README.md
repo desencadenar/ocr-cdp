@@ -220,6 +220,20 @@ Son nueve documentos y 99 campos: una muestra pequeña, elegida porque estaba re
 
 De los seis campos que siguen sin coincidir en esa muestra, cuatro son del mismo comprobante escaneado, uno es un RUC con un dígito mal leído y el último es una palabra partida por el escáner (`aprobad o`). Ninguno se corrige a mano: quedan señalados en `revision`.
 
+### Limitación conocida: importes en facturas escaneadas
+
+Con los ajustes de fábrica (`releer_recuadro_importes` en `false`), una cifra de una factura escaneada puede salir mal leída y quedar escrita en la celda. El caso típico: el OCR lee el símbolo del sol («S/») como un `7` pegado al número. Por ejemplo (ilustrativo), `S/ 1,250.00` sale como `71,250.00`.
+
+Qué hace el programa y qué no puede hacer:
+
+- Si el símbolo queda pegado a la cifra (`$755.00`) o queda solo un `7` delante del importe, **no da la cifra por leída**: la celda queda vacía y la hoja `revision` la señala.
+- Si el `7` queda pegado al número y no hay ningún símbolo de moneda, el programa **no puede distinguirlo de una cifra real** y la deja escrita. En el caso observado, el cuadre de importes salió como `datos_insuficientes` y la hoja `revision` señaló que el valor de venta no coincidía con el subtotal.
+
+Qué conviene hacer:
+
+- Antes de confiar en un importe leído de un escaneo, mira que `cuadre_de_importes` diga `cuadra` y revisa la hoja `revision`. Coteja con el original usando el archivo, la página y el fragmento que acompañan a cada dato.
+- Prueba `releer_recuadro_importes` en `true`. Relee el cuadro de importes recortado y a mayor resolución (facturas escaneadas de una sola página), y solo acepta esa lectura si las cifras suman y el total coincide con el de la página. En el caso observado dio la cifra correcta. No es una garantía: compruébalo con tus propios documentos.
+
 ## Usar el mismo script desde la terminal
 
 Reemplaza `RUC_RECEPTOR` por el número que quieres contrastar. Usa una carpeta de salida vacía y fuera de la carpeta de entrada.
