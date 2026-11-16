@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import io
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any
 import xml.etree.ElementTree as ET
 
 import pymupdf
-from PIL import Image, ImageStat
+from PIL import Image, ImageOps, ImageStat
+
+try:
+    import pillow_heif  # type: ignore[import-not-found]
+
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
+try:
+    import zxingcpp  # type: ignore[import-not-found]
+except Exception:
+    zxingcpp = None
 
 from .archives import WorkUnit, detect_format_from_bytes
 from .config import AppConfig
@@ -20,6 +34,26 @@ from .ocr import OCRExecutionError, OCREngine, OCRResult, OCRUnavailable, Tesser
 SUPPORTED_SUFFIXES = {
     ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".heic", ".xml",
 }
+
+# Anclas que abren una segunda columna en PDFs nativos (recuadro SUNAT, metadatos o importes).
+_COLUMN_BREAK_START_RE = re.compile(
+    r"^(?:"
+    r"R\s*[.:]?\s*U\s*[.:]?\s*C\b|"
+    r"FACTURA\b|BOLETA\b|NOTA\s+DE\s+(?:CR[EÉ]DITO|D[EÉ]BITO)\b|"
+    r"RECIBO\s+(?:ELECTR[ÓO]NICO\s+)?(?:POR|DE)\b|LIQUIDACI[ÓO]N\s+DE\s+COMPRA\b|"
+    r"COMPROBANTE\s+DE\s+(?:RETENCI[ÓO]N|PERCEPCI[ÓO]N)\b|"
+    r"SERIE\b|N(?:RO|°|º|[ÚU]MERO)\b|CORRELATIVO\b|"
+    r"FECHA(?:\s+DE)?\s+(?:EMISI[ÓO]N|VENCIMIENTO|VCTO)\b|F\.?\s*(?:EMISI[ÓO]N|VENCIMIENTO|VCTO)\b|"
+    r"(?:TIPO\s+DE\s+)?MONEDA\b|(?:CONDICI[ÓO]N|FORMA)\s+DE\s+PAGO\b|"
+    r"GU[IÍ]A\s+DE\s+REMISI[OÓ]N\b|ORDEN\s+DE\s+COMPRA\b|PLACA\b|TIPO\s+DE\s+NOTA\b|DOCUMENTO\s+QUE\s+MODIFICA\b|"
+    r"(?:SUB\s*TOTAL|VALOR\s+(?:DE\s+)?VENTA|OP(?:ERACIONES|\.)?\s*(?:GRAVADAS?|EXONERADAS?|INAFECTAS?|GRATUITAS?))\b|"
+    r"(?:I\.?\s*G\.?\s*V\.?|I\.?\s*S\.?\s*C\.?|ICBPER|OTROS\s+(?:CARGOS|TRIBUTOS)|DESCUENTO(?:S)?|ANTICIPO(?:S)?)\b|"
+    r"(?:IMPORTE\s+TOTAL|TOTAL\s+(?:A\s+PAGAR|VENTA|GENERAL|HONORARIOS)|NETO\s+(?:A\s+PAGAR|RECIBIDO)|RETENCI[ÓO]N)\b|"
+    r"[FBEST][A-Z0-9]{2,3}\s*[-–]\s*[0-9]{1,20}\b|"
+    r"(?:(?:S/|S/\.|US\$|USD|PEN|EUR)\s*)?[+-]?(?:\d{1,3}(?:[.,\s]\d{3})+|\d+)[.,]\d{2}$"
+    r")",
+    re.IGNORECASE,
+)
 
 
 # Se lanza cuando un documento no se puede abrir o leer (archivo dañado, formato no admitido...).
@@ -41,6 +75,7 @@ class PageRead:
     layout_lines: list[LayoutLine] = field(default_factory=list)
     structured_data: dict[str, Any] | None = None
     error_message: str | None = None
+    qr_payloads: list[str] = field(default_factory=list)
 
 
 # Lo que se leyó de un documento completo: sus páginas, los eventos del proceso y el motor de OCR que se usó.
@@ -72,15 +107,29 @@ def _quality_from_image(image: Image.Image) -> dict[str, int | float]:
     return _quality(image.width, image.height, grayscale_stddev)
 
 
-# Eventos fijos que se anotan en cada página para dejar claro qué mejoras de imagen NO se aplican
-# en esta versión (girar, enderezar, rectificar, subir contraste, segunda lectura).
-def _static_events(page_number: int) -> list[StageEvent]:
+# Eventos fijos que se anotan en cada página para dejar claro qué correcciones de imagen se aplicaron.
+def _static_events(
+    page_number: int,
+    *,
+    rotation_applied: bool = False,
+    contrast_applied: bool = False,
+) -> list[StageEvent]:
     return [
-        StageEvent("rotation_correction", "not_applied", "V1 registra orientación pero no rota automáticamente", page_number),
-        StageEvent("deskew", "not_applied", "corrección de inclinación pendiente para una versión posterior", page_number),
-        StageEvent("perspective_rectification", "not_applied", "rectificación geométrica no incluida en V1", page_number),
-        StageEvent("contrast_enhancement", "not_applied", "mejora selectiva no aplicada en V1", page_number),
-        StageEvent("alternate_region_ocr", "not_applied", "no se ejecuta un segundo motor/región en V1", page_number),
+        StageEvent(
+            "rotation_correction",
+            "succeeded" if rotation_applied else "not_applied",
+            "orientación corregida antes del OCR" if rotation_applied else "sin ajuste de orientación requerido",
+            page_number,
+        ),
+        StageEvent("deskew", "not_applied", "corrección geométrica de sesgo no requerida", page_number),
+        StageEvent("perspective_rectification", "not_applied", "rectificación geométrica no incluida", page_number),
+        StageEvent(
+            "contrast_enhancement",
+            "succeeded" if contrast_applied else "not_applied",
+            "autocontraste ligero aplicado por bajo contraste (<28 stddev)" if contrast_applied else "mejora selectiva no requerida",
+            page_number,
+        ),
+        StageEvent("alternate_region_ocr", "not_applied", "se aplica solo bajo demanda en campos dudosos", page_number),
     ]
 
 
@@ -182,8 +231,216 @@ def _ocr_image(
     )
 
 
-# Saca el texto nativo de una página de PDF junto con la posición de cada línea.
-# Las palabras se agrupan en líneas por su altura, con una tolerancia de unos 3 puntos.
+def _split_row_by_columns(row: list[Any], min_gap: float) -> list[list[Any]]:
+    """Separa palabras de una misma altura cuando hay un salto horizontal amplio hacia otra columna fiscal."""
+    if len(row) <= 1:
+        return [row]
+    segments: list[list[Any]] = []
+    current: list[Any] = [row[0]]
+    for idx in range(1, len(row)):
+        prev_word = row[idx - 1]
+        curr_word = row[idx]
+        gap = float(curr_word[0]) - float(prev_word[2])
+        if gap >= min_gap:
+            tail_text = " ".join(str(item[4]).strip() for item in row[idx:] if str(item[4]).strip()).strip()
+            if _COLUMN_BREAK_START_RE.search(tail_text):
+                segments.append(current)
+                current = [curr_word]
+                continue
+        current.append(curr_word)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _decode_qr_from_image(image: Image.Image) -> list[str]:
+    """Decodifica códigos QR locales si `zxingcpp` está instalado en el entorno."""
+    if zxingcpp is None:
+        return []
+    try:
+        barcodes = zxingcpp.read_barcodes(image)
+        out: list[str] = []
+        for code in barcodes:
+            val = (getattr(code, "text", None) or "").strip()
+            if val and val not in out:
+                out.append(val)
+        return out
+    except Exception:
+        return []
+
+
+def _extract_qr_from_pdf_page(pdf: pymupdf.Document, page: pymupdf.Page) -> list[str]:
+    """Busca códigos QR en imágenes incrustadas y, si no hay, renderizando la página (QRs vectoriales)."""
+    if zxingcpp is None:
+        return []
+    payloads: list[str] = []
+    try:
+        for info in page.get_images(full=True):
+            xref = info[0]
+            img_dict = pdf.extract_image(xref)
+            if not img_dict or not img_dict.get("image"):
+                continue
+            w = int(img_dict.get("width") or 0)
+            h = int(img_dict.get("height") or 0)
+            if w < 40 or h < 40:
+                continue
+            ratio = w / max(h, 1)
+            if not (0.65 <= ratio <= 1.55):
+                continue
+            with Image.open(io.BytesIO(img_dict["image"])) as qr_img:
+                for p in _decode_qr_from_image(qr_img):
+                    if p not in payloads:
+                        payloads.append(p)
+        if not payloads:
+            scale = 150.0 / 72.0
+            est_pixels = int(page.rect.width * scale) * int(page.rect.height * scale)
+            if 0 < est_pixels <= 16_000_000:
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+                with Image.frombytes("RGB", (pix.width, pix.height), pix.samples) as page_img:
+                    for p in _decode_qr_from_image(page_img):
+                        if p not in payloads:
+                            payloads.append(p)
+    except Exception:
+        pass
+    return payloads
+
+
+def _ocr_with_rotation_fallback(
+    image: Image.Image,
+    image_path: Path,
+    page_number: int,
+    engine: OCREngine | None,
+    available: bool,
+    unavailable_reason: str | None,
+    events: list[StageEvent],
+    dpi_tuple: tuple[int, int],
+) -> tuple[str, str, str, float | None, dict[str, float], list[LayoutLine], str | None, int]:
+    """Ejecuta OCR y, solo si falla o la confianza es muy baja (<0.45), intenta rotar según OSD (90/180/270)."""
+    text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg = _ocr_image(
+        image_path, page_number, engine, available, unavailable_reason, events
+    )
+    if not available or engine is None:
+        return text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, 0
+
+    needs_rotation_check = (not text.strip()) or (confidence is not None and confidence < 0.45)
+    detect_fn = getattr(engine, "detect_orientation", None)
+    if not needs_rotation_check or detect_fn is None:
+        return text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, 0
+
+    angle = detect_fn(image_path)
+    if angle not in {90, 180, 270}:
+        return text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, 0
+
+    rotated = image.rotate(-angle, expand=True)
+    rotated_path = image_path.with_name(f"{image_path.stem}-rot{angle}.png")
+    rotated.save(rotated_path, format="PNG", dpi=dpi_tuple)
+    rot_events: list[StageEvent] = []
+    r_text, r_eng, r_status, r_conf, r_lconf, r_layout, r_err = _ocr_image(
+        rotated_path, page_number, engine, available, unavailable_reason, rot_events
+    )
+    improved = (
+        len(r_text.strip()) > len(text.strip()) * 1.25
+        or ((r_conf or 0.0) > (confidence or 0.0) + 0.12 and len(r_text.strip()) >= max(20, len(text.strip()) * 0.8))
+    )
+    if improved:
+        events.append(
+            StageEvent("rotation_correction", "succeeded", f"página rotada {angle}° automáticamente por OSD", page_number)
+        )
+        events.extend(rot_events)
+        return r_text, r_eng, r_status, r_conf, r_lconf, r_layout, r_err, angle
+    return text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, 0
+
+
+def reocr_line_bbox(
+    unit: WorkUnit,
+    page_number: int,
+    bbox: tuple[float, float, float, float],
+    config: AppConfig,
+    engine: OCREngine | None,
+    *,
+    rotation_angle: int = 0,
+) -> str | None:
+    """Relee un recorte puntual de línea con `--psm 7` para rescatar RUC, series o importes dudosos."""
+    if engine is None or not hasattr(engine, "recognize"):
+        return None
+    available, _ = _check_engine(engine)
+    if not available:
+        return None
+    fmt = unit.source_ref.detected_format.lower()
+    raw_bytes = unit.content_bytes
+    x0, y0, x1, y1 = bbox
+    pad_x = max(12.0, (x1 - x0) * 0.08)
+    pad_y = max(8.0, (y1 - y0) * 0.45)
+
+    try:
+        if fmt == "pdf":
+            pdf = pymupdf.open(stream=raw_bytes, filetype="pdf") if raw_bytes is not None else pymupdf.open(unit.disk_path)
+            with pdf:
+                if page_number < 1 or page_number > pdf.page_count:
+                    return None
+                page = pdf[page_number - 1]
+                render_scale = config.render_dpi / 72.0
+                if rotation_angle in {90, 180, 270}:
+                    pix = page.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale), alpha=False)
+                    base_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).rotate(-rotation_angle, expand=True)
+                    crop_box = (
+                        max(0, int(x0 - pad_x)),
+                        max(0, int(y0 - pad_y)),
+                        min(base_img.width, int(x1 + pad_x)),
+                        min(base_img.height, int(y1 + pad_y)),
+                    )
+                    crop_img = base_img.crop(crop_box)
+                else:
+                    target_dpi = max(config.render_dpi, 320)
+                    clip = pymupdf.Rect(
+                        (x0 - pad_x) / render_scale,
+                        (y0 - pad_y) / render_scale,
+                        (x1 + pad_x) / render_scale,
+                        (y1 + pad_y) / render_scale,
+                    ) & page.rect
+                    if clip.is_empty:
+                        return None
+                    pix = page.get_pixmap(dpi=target_dpi, clip=clip, alpha=False)
+                    crop_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        elif fmt in {"jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp", "heic"}:
+            img = Image.open(io.BytesIO(raw_bytes)) if raw_bytes is not None else Image.open(unit.disk_path)
+            with img:
+                img.seek(max(0, page_number - 1))
+                frame = img.copy()
+                try:
+                    frame = ImageOps.exif_transpose(frame) or frame
+                except Exception:
+                    pass
+                if rotation_angle in {90, 180, 270}:
+                    frame = frame.rotate(-rotation_angle, expand=True)
+                frame = frame.convert("RGB")
+                crop_box = (
+                    max(0, int(x0 - pad_x)),
+                    max(0, int(y0 - pad_y)),
+                    min(frame.width, int(x1 + pad_x)),
+                    min(frame.height, int(y1 + pad_y)),
+                )
+                crop_img = frame.crop(crop_box)
+        else:
+            return None
+
+        if crop_img.width < 10 or crop_img.height < 6:
+            return None
+        if crop_img.height < 48:
+            factor = 48.0 / crop_img.height
+            crop_img = crop_img.resize((int(crop_img.width * factor), int(crop_img.height * factor)), Image.Resampling.LANCZOS)
+        crop_img = ImageOps.autocontrast(ImageOps.grayscale(crop_img), cutoff=1)
+        crop_img = ImageOps.expand(crop_img, border=10, fill=255)
+        with tempfile.TemporaryDirectory(prefix="ocr-crop-") as tmp_dir:
+            crop_path = Path(tmp_dir) / "line.png"
+            crop_img.save(crop_path, format="PNG", dpi=(320, 320))
+            res = engine.recognize(crop_path, page_segmentation_mode=7)
+        cleaned = " ".join(res.text.split()).strip()
+        return cleaned or None
+    except Exception:
+        return None
+# Las palabras se agrupan en líneas por su altura (tolerancia ~3 puntos) y se parten
+# si existe un salto horizontal amplio entre dos columnas independientes.
 def _extract_native_pdf_layout(page: pymupdf.Page, y_tol: float = 3.0) -> tuple[str, list[LayoutLine]]:
     raw_text = page.get_text("text").strip()
     if not raw_text:
@@ -196,6 +453,9 @@ def _extract_native_pdf_layout(page: pymupdf.Page, y_tol: float = 3.0) -> tuple[
             for i, line in enumerate(lines, start=1)
         ]
         return "\n".join(lines), layout
+
+    page_w = max(float(page.rect.width), 1.0)
+    min_col_gap = max(18.0, page_w * 0.045)
 
     # Paso 1: ordenar las palabras de arriba abajo y de izquierda a derecha, y agruparlas por filas.
     words_sorted = sorted(words, key=lambda w: (round(float(w[1]) / y_tol), float(w[0])))
@@ -210,14 +470,14 @@ def _extract_native_pdf_layout(page: pymupdf.Page, y_tol: float = 3.0) -> tuple[
                 cur_y = wy
         else:
             cur_row.sort(key=lambda item: float(item[0]))
-            grouped_rows.append(cur_row)
+            grouped_rows.extend(_split_row_by_columns(cur_row, min_col_gap))
             cur_row = [word]
             cur_y = wy
     if cur_row:
         cur_row.sort(key=lambda item: float(item[0]))
-        grouped_rows.append(cur_row)
+        grouped_rows.extend(_split_row_by_columns(cur_row, min_col_gap))
 
-    # Paso 2: de cada fila armamos una línea de texto, con su caja contenedora y el bloque al que pertenece.
+    # Paso 2: de cada segmento armamos una línea de texto, con su caja contenedora y el bloque al que pertenece.
     layout_lines: list[LayoutLine] = []
     text_lines: list[str] = []
     for idx, row in enumerate(grouped_rows, start=1):
@@ -535,19 +795,37 @@ def _parse_xml_bytes(raw_bytes: bytes, source_path: Path) -> DocumentRead:
     )
 
 
+def _is_native_text_garbled(text: str) -> tuple[bool, int, float]:
+    """Detecta mapas ToUnicode corruptos, glifos PUA (\uE000-\uF8FF) o marcadores (cid:...)."""
+    non_space = [ch for ch in text if not ch.isspace()]
+    if not non_space:
+        return False, 0, 0.0
+    cid_hits = len(re.findall(r"\(cid:\d+\)", text, flags=re.IGNORECASE))
+    garbled_chars = sum(
+        1
+        for ch in non_space
+        if ch == "\ufffd" or (0xE000 <= ord(ch) <= 0xF8FF) or (ord(ch) < 32 and ch not in "\r\n\t")
+    )
+    total_bad = garbled_chars + cid_hits * 5
+    bad_ratio = round(total_bad / max(len(non_space), 1), 4)
+    alnum_count = sum(1 for ch in non_space if ch.isalnum())
+    alnum_ratio = alnum_count / max(len(non_space), 1)
+    is_garbled = total_bad >= 3 or bad_ratio >= 0.08 or alnum_ratio < 0.25
+    return is_garbled, total_bad, bad_ratio
+
+
 # Decide, para cada página de PDF, si alcanza con su texto nativo o si hay que hacerle OCR.
 def _evaluate_pdf_page_reading_mode(
     page: pymupdf.Page,
     native_text: str,
     layout_lines: list[LayoutLine],
 ) -> tuple[str, str, dict[str, int | float | str]]:
-    """Decide si el texto nativo basta o si la página requiere OCR sobre contenido rasterizado.
+    """Decide si el texto nativo basta o si la página requiere OCR sobre contenido rasterizado o vectorizado.
 
-    Un pie de página seleccionable, un sello o una marca de archivo pueden acompañar
-    una factura escaneada. Por ello medimos qué proporción de la página ocupan las
-    imágenes rasterizadas y qué cobertura vertical/textual aporta la capa nativa.
+    Un pie de página seleccionable, un sello, un mapa de fuentes corrupto (ToUnicode) o un cuerpo
+    convertido en curvas vectoriales pueden acompañar una factura donde el texto seleccionable no basta.
     """
-    # Paso 1: medir la página y cuánto de ella ocupan las imágenes.
+    # Paso 1: medir la página, cuánto ocupan las imágenes y cuántos trazos vectoriales existen.
     page_w = max(float(page.rect.width), 1.0)
     page_h = max(float(page.rect.height), 1.0)
     page_area = page_w * page_h
@@ -575,10 +853,16 @@ def _evaluate_pdf_page_reading_mode(
     except Exception:
         image_count = len(page.get_images(full=True))
 
+    drawing_count = 0
+    try:
+        drawing_count = len(page.get_drawings())
+    except Exception:
+        drawing_count = 0
+
     image_coverage_ratio = round(min(total_img_area / page_area, 1.0), 4)
     max_image_ratio = round(min(max_img_area / page_area, 1.0), 4)
 
-    # Paso 2: medir el texto nativo: cuántos caracteres y líneas tiene y qué parte de la altura de la página cubre.
+    # Paso 2: medir el texto nativo: cuántos caracteres y líneas tiene, su legibilidad y su cobertura vertical.
     stripped_native = native_text.strip()
     native_chars = len(stripped_native)
     native_lines = len(layout_lines)
@@ -593,13 +877,18 @@ def _evaluate_pdf_page_reading_mode(
         vertical_span_ratio = 0.0
         confined_to_margin = True
 
+    is_garbled, garbled_count, garbled_ratio = _is_native_text_garbled(stripped_native)
+
     metrics: dict[str, int | float | str] = {
         "native_text_chars": native_chars,
         "layout_lines": native_lines,
         "image_count": image_count,
+        "drawing_count": drawing_count,
         "image_coverage_ratio": image_coverage_ratio,
         "max_image_ratio": max_image_ratio,
         "native_vertical_span_ratio": vertical_span_ratio,
+        "garbled_char_count": garbled_count,
+        "garbled_char_ratio": garbled_ratio,
     }
 
     # Paso 3: reglas de decisión. Sin texto nativo, OCR.
@@ -607,20 +896,38 @@ def _evaluate_pdf_page_reading_mode(
         metrics["reading_decision"] = "ocr_pagina_sin_texto_nativo"
         return "ocr", "sin texto nativo seleccionable", metrics
 
-    # Si no hay una imagen grande que ocupe la página, el texto nativo basta.
-    has_document_raster = image_coverage_ratio >= 0.15 or max_image_ratio >= 0.15
-    if not has_document_raster:
-        metrics["reading_decision"] = "nativo_sin_imagen_documental"
-        return "native_pdf_text", "texto PDF nativo sin imagen rasterizada dominante", metrics
+    # Si la capa de texto nativo tiene glifos corruptos (ToUnicode roto, \ufffd o área privada), forzamos OCR.
+    if is_garbled:
+        metrics["reading_decision"] = "ocr_texto_nativo_corrupto"
+        return (
+            "ocr",
+            f"capa de texto nativo con codificación corrupta ({garbled_count} glifos inválidos, {garbled_ratio:.0%})",
+            metrics,
+        )
 
-    # Cuando coexisten una imagen documental grande y poco texto nativo (o confinado al margen),
-    # el texto nativo suele ser un pie, encabezado o sello sobre un documento escaneado.
     is_marginal_native = (
         confined_to_margin
         or native_lines < 4
         or native_chars < 140
         or vertical_span_ratio < 0.18
     )
+
+    has_document_raster = image_coverage_ratio >= 0.15 or max_image_ratio >= 0.15
+    if not has_document_raster:
+        # Algunos PDFs convierten el cuerpo del comprobante en curvas vectoriales (get_drawings)
+        # dejando sólo un pie o marca marginal como texto seleccionable.
+        if drawing_count >= 25 and is_marginal_native:
+            metrics["reading_decision"] = "ocr_pagina_vectorizada_con_texto_marginal"
+            return (
+                "ocr",
+                f"página vectorizada ({drawing_count} trazos) con texto nativo marginal ({native_chars} caracteres)",
+                metrics,
+            )
+        metrics["reading_decision"] = "nativo_sin_imagen_documental"
+        return "native_pdf_text", "texto PDF nativo sin imagen rasterizada dominante", metrics
+
+    # Cuando coexisten una imagen documental grande y poco texto nativo (o confinado al margen),
+    # el texto nativo suele ser un pie, encabezado o sello sobre un documento escaneado.
     if is_marginal_native:
         metrics["reading_decision"] = "ocr_sobre_pagina_hibrida_con_texto_marginal"
         return (
@@ -709,26 +1016,27 @@ def _read_pdf_document(
         # Paso 2: recorrer las páginas una por una.
         for index, page in enumerate(pdf, start=1):
             page_started = time.perf_counter()
-            page_events = _static_events(index)
             # Primero el texto nativo, con su posición.
             native_text, layout_lines = _extract_native_pdf_layout(page)
-            page_events.append(
-                StageEvent(
-                    "native_text",
-                    "succeeded" if native_text else "empty",
-                    f"{len(native_text)} caracteres",
-                    index,
-                    duration_ms=(time.perf_counter() - page_started) * 1000.0,
-                )
-            )
             # Luego se decide si ese texto basta.
             reading_mode, reading_reason, decision_metrics = _evaluate_pdf_page_reading_mode(
                 page, native_text, layout_lines
             )
             # Caso A: el texto nativo basta, no se hace OCR.
             if reading_mode == "native_pdf_text":
+                page_events = _static_events(index)
+                page_events.append(
+                    StageEvent(
+                        "native_text",
+                        "succeeded" if native_text else "empty",
+                        f"{len(native_text)} caracteres",
+                        index,
+                        duration_ms=(time.perf_counter() - page_started) * 1000.0,
+                    )
+                )
                 page_events.append(StageEvent("quality_analysis", "succeeded", reading_reason, index))
                 page_events.append(StageEvent("ocr", "skipped", "se usó texto nativo representativo", index))
+                qr_payloads = _extract_qr_from_pdf_page(pdf, page)
                 pages.append(
                     PageRead(
                         page_number=index,
@@ -737,6 +1045,7 @@ def _read_pdf_document(
                         status="read",
                         quality=decision_metrics,
                         layout_lines=layout_lines,
+                        qr_payloads=qr_payloads,
                     )
                 )
                 events.extend(page_events)
@@ -746,10 +1055,19 @@ def _read_pdf_document(
             # si pasa, queda sin leer y se anota el motivo.
             scale = cfg.render_dpi / 72.0
             estimated_pixels = int(page.rect.width * scale) * int(page.rect.height * scale)
-            page_events.append(
-                StageEvent("quality_analysis", "succeeded", f"{reading_reason}; estimado {estimated_pixels} píxeles", index)
-            )
             if estimated_pixels > cfg.max_pixels:
+                page_events = _static_events(index)
+                page_events.append(
+                    StageEvent(
+                        "native_text",
+                        "succeeded" if native_text else "empty",
+                        f"{len(native_text)} caracteres",
+                        index,
+                    )
+                )
+                page_events.append(
+                    StageEvent("quality_analysis", "succeeded", f"{reading_reason}; estimado {estimated_pixels} píxeles", index)
+                )
                 reason = f"página supera límite {cfg.max_pixels} píxeles"
                 page_events.append(StageEvent("render", "failed", reason, index))
                 pages.append(
@@ -764,11 +1082,31 @@ def _read_pdf_document(
                 )
                 events.extend(page_events)
                 continue
+
             # Se convierte la página en imagen a la resolución configurada.
             render_started = time.perf_counter()
             pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             quality_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-            quality: dict[str, int | float | str] = {**decision_metrics, **_quality_from_image(quality_image)}
+            img_quality = _quality_from_image(quality_image)
+            contrast_applied = False
+            if float(img_quality.get("grayscale_stddev", 99.0)) < 28.0:
+                quality_image = ImageOps.autocontrast(quality_image, cutoff=1)
+                contrast_applied = True
+            qr_payloads = _decode_qr_from_image(quality_image)
+            quality: dict[str, int | float | str] = {**decision_metrics, **img_quality}
+            page_events = _static_events(index, contrast_applied=contrast_applied)
+            page_events.append(
+                StageEvent(
+                    "native_text",
+                    "succeeded" if native_text else "empty",
+                    f"{len(native_text)} caracteres",
+                    index,
+                )
+            )
+            page_events.append(
+                StageEvent("quality_analysis", "succeeded", f"{reading_reason}; estimado {estimated_pixels} píxeles", index)
+            )
+
             with tempfile.TemporaryDirectory(prefix="ocr-fiscal-") as temp_dir:
                 image_path = Path(temp_dir) / f"page-{index:04d}.png"
                 # Guardar el PNG con metadato DPI explícito evita que Tesseract asuma ~96 DPI
@@ -786,20 +1124,30 @@ def _read_pdf_document(
                         duration_ms=(time.perf_counter() - render_started) * 1000.0,
                     )
                 )
-                # Se comprueba Tesseract y se lee la imagen de la página.
+                # Se comprueba Tesseract y se lee la imagen de la página (con rotación OSD automática si falla).
                 available, unavailable_reason = get_engine_state()
-                text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg = _ocr_image(
-                    image_path, index, active_engine, available, unavailable_reason, page_events
+                text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, rot_angle = _ocr_with_rotation_fallback(
+                    quality_image,
+                    image_path,
+                    index,
+                    active_engine,
+                    available,
+                    unavailable_reason,
+                    page_events,
+                    (cfg.render_dpi, cfg.render_dpi),
                 )
+            if rot_angle:
+                quality["rotation_angle"] = rot_angle
             used_engine = engine_name if engine_name != "" else used_engine
             if active_engine is not None and engine_name != "":
                 used_version = active_engine.version
 
-            # Si la página híbrida tenía un pie/sello nativo que el OCR no capturó y el OCR tuvo éxito,
-            # conservamos la evidencia del pie al final sin reemplazar el cuerpo reconocido por OCR.
+            # Si la página híbrida tenía un pie/sello nativo legible que el OCR no capturó y el OCR tuvo éxito,
+            # conservamos la evidencia del pie al final escalando sus coordenadas al espacio en píxeles del OCR.
             combined_text = text
             combined_layout = list(ocr_layout)
-            if text and native_text.strip():
+            is_garbled_native = decision_metrics.get("reading_decision") == "ocr_texto_nativo_corrupto"
+            if text and native_text.strip() and not is_garbled_native:
                 existing_upper = text.upper()
                 extra_native = [
                     ln for ln in layout_lines if ln.text.strip() and ln.text.strip().upper() not in existing_upper
@@ -809,12 +1157,22 @@ def _read_pdf_document(
                     combined_text = f"{text}\n{extra_str}".strip()
                     base_line_no = len(combined_layout)
                     for offset, ln in enumerate(extra_native, start=1):
+                        scaled_bbox = (
+                            (
+                                round(ln.bbox[0] * scale, 2),
+                                round(ln.bbox[1] * scale, 2),
+                                round(ln.bbox[2] * scale, 2),
+                                round(ln.bbox[3] * scale, 2),
+                            )
+                            if ln.bbox is not None
+                            else None
+                        )
                         combined_layout.append(
                             LayoutLine(
                                 line_number=base_line_no + offset,
                                 text=ln.text.strip(),
                                 block_number=ln.block_number,
-                                bbox=ln.bbox,
+                                bbox=scaled_bbox,
                                 ocr_confidence=ln.ocr_confidence,
                                 source="native_pdf_text",
                             )
@@ -831,6 +1189,7 @@ def _read_pdf_document(
                     line_confidences=line_confidences,
                     layout_lines=combined_layout,
                     error_message=err_msg,
+                    qr_payloads=qr_payloads,
                 )
             )
             events.extend(page_events)
@@ -880,11 +1239,22 @@ def _read_image_document(
         for index in range(frame_count):
             image.seek(index)
             page_number = index + 1
-            page_events = _static_events(page_number)
-            width, height = image.size
+            raw_frame = image.copy()
+            # Corregimos orientación EXIF de fotos móviles si viene indicada en el metadato.
+            rotation_applied = False
+            try:
+                transposed = ImageOps.exif_transpose(raw_frame)
+                if transposed is not None and transposed.size != raw_frame.size:
+                    rotation_applied = True
+                raw_frame = transposed or raw_frame
+            except Exception:
+                pass
+
+            width, height = raw_frame.size
             pixels = width * height
             # Si es demasiado grande, no se lee y se anota el motivo.
             if pixels > cfg.max_pixels:
+                page_events = _static_events(page_number, rotation_applied=rotation_applied)
                 reason = f"imagen supera límite {cfg.max_pixels} píxeles"
                 page_events.append(StageEvent("quality_analysis", "failed", reason, page_number))
                 page_events.append(StageEvent("ocr", "skipped", "no se convirtió la imagen", page_number))
@@ -900,17 +1270,44 @@ def _read_image_document(
                 )
                 events.extend(page_events)
                 continue
-            # Se guarda el cuadro como PNG temporal y se lee con OCR.
-            frame = image.convert("RGB")
+
+            # Se convierte el cuadro a RGB, se evalúa contraste y se guarda como PNG temporal con DPI explícito.
+            frame = raw_frame.convert("RGB")
             quality = _quality_from_image(frame)
+            contrast_applied = False
+            if float(quality.get("grayscale_stddev", 99.0)) < 28.0:
+                frame = ImageOps.autocontrast(frame, cutoff=1)
+                contrast_applied = True
+            qr_payloads = _decode_qr_from_image(frame)
+
+            page_events = _static_events(
+                page_number,
+                rotation_applied=rotation_applied,
+                contrast_applied=contrast_applied,
+            )
             page_events.append(StageEvent("quality_analysis", "succeeded", f"{pixels} píxeles", page_number))
             with tempfile.TemporaryDirectory(prefix="ocr-fiscal-") as temp_dir:
                 image_path = Path(temp_dir) / f"frame-{page_number:04d}.png"
-                frame.save(image_path, format="PNG")
-                available, unavailable_reason = get_engine_state()
-                text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg = _ocr_image(
-                    image_path, page_number, active_engine, available, unavailable_reason, page_events
+                img_dpi = image.info.get("dpi")
+                target_dpi = (
+                    (int(img_dpi[0]), int(img_dpi[1]))
+                    if isinstance(img_dpi, tuple) and len(img_dpi) == 2 and img_dpi[0] and img_dpi[1]
+                    else (cfg.render_dpi, cfg.render_dpi)
                 )
+                frame.save(image_path, format="PNG", dpi=target_dpi)
+                available, unavailable_reason = get_engine_state()
+                text, engine_name, page_status, confidence, line_confidences, ocr_layout, err_msg, rot_angle = _ocr_with_rotation_fallback(
+                    frame,
+                    image_path,
+                    page_number,
+                    active_engine,
+                    available,
+                    unavailable_reason,
+                    page_events,
+                    target_dpi,
+                )
+            if rot_angle:
+                quality["rotation_angle"] = rot_angle
             used_engine = engine_name if engine_name != "" else used_engine
             if active_engine is not None and engine_name != "":
                 used_version = active_engine.version
@@ -925,6 +1322,7 @@ def _read_image_document(
                     line_confidences=line_confidences,
                     layout_lines=ocr_layout,
                     error_message=err_msg,
+                    qr_payloads=qr_payloads,
                 )
             )
             events.extend(page_events)

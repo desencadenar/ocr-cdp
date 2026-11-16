@@ -96,6 +96,8 @@ def detect_format_from_bytes(header: bytes, filename: str = "") -> str:
         return "bmp"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "webp"
+    if len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12] in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+        return "heic"
     stripped = header.lstrip(b"\xef\xbb\xbf \t\r\n")
     if stripped.startswith((b"<?xml", b"<Invoice", b"<CreditNote", b"<DebitNote", b"<ubl:")):
         return "xml"

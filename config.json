@@ -7,5 +7,9 @@
   "maximo_pixeles": 40000000,
   "releer_recuadro_importes": false,
   "revisar_archivos_zip": true,
-  "padron_ruc": null
+  "exportar_pdf_ordenado": false,
+  "padron_ruc": null,
+  "padron_dias_maximos": null,
+  "unificar_notas_en_proveedor": true,
+  "tolerancia_redondeo": 0.02
 }

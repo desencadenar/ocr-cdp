@@ -1,3 +1,5 @@
+"""Interfaz de línea de comandos para ejecutar análisis, reexportación, calibración, carga de padrón y ventana."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +14,7 @@ from .storage import StateStore
 from .tax import validate_ruc
 
 
-# Define los comandos que acepta `python iniciar.py`: scan, export, calibrar, plantilla-calibracion y ui.
+# Define los comandos que acepta `python iniciar.py`: scan, export, calibrar, plantilla-calibracion, preparar-padron y ui.
 def _parser() -> argparse.ArgumentParser:
     # El parser principal; cada comando cuelga de él como subcomando.
     parser = argparse.ArgumentParser(
@@ -29,6 +31,11 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--config", type=Path, help="Archivo JSON de ajustes. Por defecto, config.json.")
     scan.add_argument("--padron-db", type=Path, help="Padrón SQLite local para contrastar la razón social")
     scan.add_argument("--no-inspect-archives", action="store_true", help="Omitir el contenido de los ZIP")
+    scan.add_argument(
+        "--exportar-pdf",
+        action="store_true",
+        help="Generar expediente en PDF ordenado por proveedor dentro de la carpeta de salida",
+    )
 
     # export: vuelve a armar el Excel a partir del estado guardado de una corrida, sin releer los documentos.
     export = commands.add_parser("export", help="Volver a generar el Excel desde el estado de una corrida")
@@ -45,6 +52,13 @@ def _parser() -> argparse.ArgumentParser:
     # plantilla-calibracion: crea el Excel vacío donde se anota esa referencia.
     template = commands.add_parser("plantilla-calibracion", help="Crear el Excel para etiquetar la muestra")
     template.add_argument("--output", type=Path, required=True)
+
+    # preparar-padron: convierte el ZIP o TXT oficial del Padrón Reducido SUNAT a una base SQLite local.
+    padron_cmd = commands.add_parser("preparar-padron", help="Convertir el Padrón Reducido RUC (TXT o ZIP) a SQLite")
+    padron_cmd.add_argument("--input", type=Path, required=True, help="Archivo TXT o ZIP del Padrón Reducido SUNAT")
+    padron_cmd.add_argument("--output", type=Path, required=True, help="Ruta de salida .sqlite3")
+    padron_cmd.add_argument("--cutoff-date", help="Fecha de corte YYYY-MM-DD (opcional; usa la del archivo si se omite)")
+    padron_cmd.add_argument("--encoding", default="cp1252", help="Codificación del archivo fuente (por defecto cp1252)")
 
     # ui: abre la ventana. Es lo que ocurre si no se escribe ningún comando.
     ui = commands.add_parser("ui", help="Abrir la interfaz gráfica")
@@ -87,6 +101,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.no_inspect_archives:
                 config.inspect_archives = False
                 config.inspect_nested_archives = False
+            if args.exportar_pdf:
+                config.export_pdf_folders = True
             # Leer todos los documentos (el estado queda guardado en la carpeta de salida) y escribir CDP.xlsx.
             processor = FiscalProcessor(output, config)
             summary = processor.scan(source)
@@ -110,6 +126,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .benchmark import write_reference_template
 
             workbook = write_reference_template(args.output)
+        # preparar-padron: importa el Padrón Reducido SUNAT a una base SQLite local.
+        elif args.command == "preparar-padron":
+            from .padron import cargar_padron_staging
+
+            padron_res = cargar_padron_staging(
+                args.input,
+                args.output,
+                cutoff_date=args.cutoff_date,
+                encoding=args.encoding,
+            )
+            print(
+                f"{padron_res.db_path} ({padron_res.unique_rucs} RUCs válidos, "
+                f"rechazados={padron_res.rejected_rows}, fecha_corte={padron_res.cutoff_date})"
+            )
+            return 0
         else:
             # ui (comando por omisión): abrir la ventana. Si Python no trae Tkinter, se explica cómo usar la terminal.
             config = load_config(args.config)

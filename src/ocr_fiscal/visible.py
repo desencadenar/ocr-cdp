@@ -81,3 +81,67 @@ def visible_labels(evidence: Mapping[str, Any], field: str) -> str:
         if (code := item.get("normalized_value")) in _LABELS
     ]
     return " | ".join(dict.fromkeys(labels))
+
+
+_SPOT_RATE_RE = re.compile(
+    r"(?:%\s*(?:DETRACCI[ÓO]N|SPOT)|PORCENTAJE(?:\s+DE\s+(?:DETRACCI[ÓO]N|SPOT))?|DETRACCI[ÓO]N|SPOT)\s*(?:\([^)]*\))?\s*[:=\-]?\s*"
+    r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%",
+    re.IGNORECASE,
+)
+_SPOT_RATE_PAREN_RE = re.compile(
+    r"(?:DETRACCI[ÓO]N|SPOT)\s*\(\s*(\d{1,2}(?:[.,]\d{1,2})?)\s*%\s*\)",
+    re.IGNORECASE,
+)
+_SPOT_CODE_RE = re.compile(
+    r"(?:BIEN\s*(?:O|/)\s*SERVICIO(?:\s+SUJETO\s+A\s+DETRACCI[ÓO]N)?|C[ÓO]D(?:IGO|\.)?\s*(?:DE\s+)?(?:BIEN(?:\s+O\s+SERVICIO)?|SPOT|DETRACCI[ÓO]N))\s*[:=\-]?\s*"
+    r"([0-9]{3})(?!\d)",
+    re.IGNORECASE,
+)
+_SPOT_ACCOUNT_RE = re.compile(
+    r"(?:CTA\.?\s*(?:DE\s+)?DETRACCI[ÓO]N(?:ES)?|CUENTA\s+(?:DE\s+)?DETRACCI[ÓO]N(?:ES)?|"
+    r"CUENTA\s+(?:DEL\s+)?BANCO\s+DE\s+LA\s+NACI[ÓO]N|CTA\.?\s*(?:CTE\.?\s*)?B\.?N\.?|BANCO\s+DE\s+LA\s+NACI[ÓO]N)\s*[:.#\-N°º]*\s*"
+    r"([0-9][0-9\- ]{6,22}[0-9])",
+    re.IGNORECASE,
+)
+
+
+def extract_spot_details(lines: Sequence[str]) -> dict[str, tuple[str, int, str] | None]:
+    """Extrae % de detracción, código de bien/servicio SPOT y cuenta del Banco de la Nación observados.
+
+    Devuelve un dict con claves `rate`, `code`, `account`, cada una con `(valor_normalizado, idx_linea, excerpt)` o None.
+    Si hay valores contradictorios para un mismo dato dentro del bloque, lo deja en None (no inventa ni elige).
+    """
+    rates: list[tuple[str, int, str]] = []
+    codes: list[tuple[str, int, str]] = []
+    accounts: list[tuple[str, int, str]] = []
+
+    for idx, line in enumerate(lines):
+        text = line.strip()
+        if not text:
+            continue
+        for pat in (_SPOT_RATE_RE, _SPOT_RATE_PAREN_RE):
+            for m in pat.finditer(text):
+                val = m.group(1).replace(",", ".")
+                rates.append((val, idx, text))
+        for m in _SPOT_CODE_RE.finditer(text):
+            codes.append((m.group(1), idx, text))
+        if re.search(r"\b(?:DETRACCI[ÓO]N|SPOT)\b", text, re.IGNORECASE):
+            for m in re.finditer(r"\bC[ÓO]D(?:IGO|\.)?\s*[:=\-]?\s*([0-9]{3})(?!\d)", text, re.IGNORECASE):
+                codes.append((m.group(1), idx, text))
+        for m in _SPOT_ACCOUNT_RE.finditer(text):
+            acct = re.sub(r"\s+", "", m.group(1)).strip("-")
+            digits_only = acct.replace("-", "")
+            if 8 <= len(digits_only) <= 16:
+                accounts.append((acct, idx, text))
+
+    def _pick_unique(items: list[tuple[str, int, str]]) -> tuple[str, int, str] | None:
+        distinct = {v for v, _, _ in items}
+        if len(distinct) == 1:
+            return items[0]
+        return None
+
+    return {
+        "rate": _pick_unique(rates),
+        "code": _pick_unique(codes),
+        "account": _pick_unique(accounts),
+    }

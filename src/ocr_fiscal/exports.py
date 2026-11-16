@@ -38,7 +38,7 @@ OUTPUT_FILENAME = "CDP.xlsx"
 # Las fechas se guardan como fechas reales de Excel y se muestran como día/mes/año.
 DATE_FORMAT = "dd/mm/yyyy"
 # Columnas que contienen fechas y que se convierten en fechas de Excel.
-DATE_KEYS = {"valid_issue_date", "issue_date_normalized", "official_validation_date", "emitter_padron_cutoff_date"}
+DATE_KEYS = {"valid_issue_date", "issue_date_normalized", "due_date_normalized", "official_validation_date", "emitter_padron_cutoff_date"}
 # Nombre de la columna de moneda que acompaña a la detracción, la retención y la percepción.
 SETTLEMENT_CURRENCY_EXPORT = {
     "importe_detraccion": "Moneda de detracción",
@@ -66,6 +66,7 @@ SETTLEMENT_EXPORT = [
 # Columnas de la hoja principal (cdp_detectados): el título que lleva en el Excel y el nombre interno que la alimenta.
 # El nombre «CDP válidos» es heredado: la hoja sólo lista comprobantes detectados y nada aquí acredita su validez oficial.
 CDP_VALIDOS_COLUMNS: list[tuple[str, str]] = [
+    ("ID documento", "document_id"),
     ("RUC emisor", "valid_emitter_ruc"),
     ("Razón social observada", "valid_issuer_name_observed"),
     ("Tipo", "valid_document_type"),
@@ -73,16 +74,32 @@ CDP_VALIDOS_COLUMNS: list[tuple[str, str]] = [
     ("Serie", "valid_series"),
     ("Correlativo", "valid_correlativo"),
     ("Fecha de emisión", "valid_issue_date"),
+    ("Fecha de vencimiento", "due_date_normalized"),
+    ("Condición de pago", "payment_condition_normalized"),
+    ("N° cuotas", "installments_count"),
     ("RUC adquirente", "valid_recipient_ruc"),
+    ("Tipo doc. adquirente", "recipient_doc_type"),
     ("Moneda", "valid_currency"),
     *AMOUNTS_EXPORT,
+    ("Tasa IGV efectiva (%)", "tasa_igv_efectiva"),
+    ("Control tasa IGV", "igv_rate_status"),
     *SETTLEMENT_EXPORT,
+    ("Apto crédito fiscal (preliminar)", "apto_credito_fiscal_preliminar"),
+    ("Alerta bancarización", "bancarizacion_flag"),
     ("Estado oficial", "official_validation_status"),
     ("Fecha de verificación", "official_validation_date"),
     ("Archivo de origen", "valid_source_locator"),
     ("Página", "valid_page_locator"),
     ("Descripción observada", "valid_description_observed"),
+    ("Resumen de ítems", "line_items_summary"),
+    ("Observaciones impresas", "observations_text"),
+    ("Orden de compra citada", "purchase_order_ref"),
+    ("Guía de remisión citada", "remision_guide_ref"),
+    ("Placa vehicular", "vehicle_plate"),
     ("Detracción visible", "detraccion_visible"),
+    ("% Detracción", "detraccion_rate"),
+    ("Código SPOT", "detraccion_code"),
+    ("Cuenta BN detracción", "detraccion_account"),
     ("Retención visible", "retencion_visible"),
 ]
 
@@ -104,9 +121,13 @@ AJUSTES_COLUMNS: list[tuple[str, str]] = [
     ("Denominación observada", "document_title"),
     ("Evidencia de la denominación", "document_title_evidence"),
     ("Descripción tipo nota", "note_type_label"),
+    ("Código motivo SUNAT", "note_type_code"),
+    ("Motivo ajuste leído", "note_type_description"),
     ("Serie nota", "series_normalized"),
     ("Correlativo nota", "correlativo_normalized"),
     ("Fecha emisión", "issue_date_normalized"),
+    ("Fecha vencimiento", "due_date_normalized"),
+    ("Condición de pago", "payment_condition_normalized"),
     ("RUC emisor", "emitter_ruc_normalized"),
     ("Razón social emisor", "issuer_name_normalized"),
     ("RUC adquirente", "recipient_ruc_normalized"),
@@ -118,9 +139,18 @@ AJUSTES_COLUMNS: list[tuple[str, str]] = [
     ("Comprobante afectado en lote", "affected_present_in_batch"),
     ("Ubicaciones comprobante afectado", "affected_locations_in_batch"),
     ("Moneda", "currency_normalized"),
+    ("Signo contable", "note_sign"),
+    ("Base gravada con signo", "gravado_signed"),
+    ("IGV con signo", "igv_signed"),
+    ("Total con signo", "total_signed"),
     *AMOUNTS_EXPORT,
+    ("Tasa IGV efectiva (%)", "tasa_igv_efectiva"),
+    ("Control tasa IGV", "igv_rate_status"),
     *SETTLEMENT_EXPORT,
     ("Glosa / Motivo ajuste", "general_description"),
+    ("Requiere revisión humana", "requires_human_review"),
+    ("Archivo PDF ordenado", "normalized_filename"),
+    ("Ruta PDF expediente", "organized_path"),
     ("Observaciones", "observations"),
 ]
 
@@ -149,6 +179,8 @@ REVIEW_COLUMNS: list[tuple[str, str]] = [
     ("Coincide RUC objetivo", "recipient_ruc_match"),
     ("Tipo-Serie-Correlativo", "document_identity"),
     ("Total normalizado", "total_normalized"),
+    ("Archivo PDF ordenado", "normalized_filename"),
+    ("Ruta PDF expediente", "organized_path"),
     ("Candidatos / Evidencia", "candidates_or_evidence"),
 ]
 
@@ -272,15 +304,23 @@ def _ensure_reconciled_documents(documents: list[dict[str, Any]]) -> None:
         if len(rec_rucs) > 1:
             conflicts.append(f"ruc_adquirente({sorted(rec_rucs)})")
         totals_dec: list[Decimal] = []
+        igvs_dec: list[Decimal] = []
+        gravs_dec: list[Decimal] = []
         for it in group:
-            raw_tot = (it.get("fields_normalized") or {}).get("total")
-            if raw_tot:
-                try:
-                    totals_dec.append(Decimal(str(raw_tot).replace(",", "")))
-                except InvalidOperation:
-                    pass
+            norm_map = it.get("fields_normalized") or {}
+            for fname_chk, target_list in (("total", totals_dec), ("igv", igvs_dec), ("gravado", gravs_dec)):
+                raw_val = norm_map.get(fname_chk)
+                if raw_val:
+                    try:
+                        target_list.append(Decimal(str(raw_val).replace(",", "")))
+                    except InvalidOperation:
+                        pass
         if len(totals_dec) > 1 and (max(totals_dec) - min(totals_dec)) > Decimal("0.02"):
             conflicts.append(f"total({sorted(str(d) for d in set(totals_dec))})")
+        if len(igvs_dec) > 1 and (max(igvs_dec) - min(igvs_dec)) > Decimal("0.02"):
+            conflicts.append(f"igv({sorted(str(d) for d in set(igvs_dec))})")
+        if len(gravs_dec) > 1 and (max(gravs_dec) - min(gravs_dec)) > Decimal("0.02"):
+            conflicts.append(f"base_gravada({sorted(str(d) for d in set(gravs_dec))})")
 
         if conflicts:
             reason_msg = (
@@ -303,8 +343,18 @@ def _ensure_reconciled_documents(documents: list[dict[str, Any]]) -> None:
             key_loc = it.get("source_id") or it.get("display_location") or it.get("original_path")
             single_unit = 1 if unit_counts.get(key_loc, 1) == 1 else 0
             no_err = 1 if not it.get("read_error") else 0
-            on_disk = 1 if (int(it.get("nested_depth") or 0) == 0 and it.get("member_path") is None) else 0
             is_native = 1 if it.get("reading_source") == "native_pdf_text" else 0
+            checks = it.get("derived_checks") or []
+            arith_ok = 1 if any(
+                chk.get("check") == "arithmetic_total_reconciliation" and chk.get("consistent")
+                for chk in checks
+            ) else 0
+            qr_ok = 1 if any(
+                chk.get("check") == "sunat_qr_crosscheck" and chk.get("status") == "coincide"
+                for chk in checks
+            ) else 0
+            few_reviews = len(it.get("secondary_review_fields") or [])
+            on_disk = 1 if (int(it.get("nested_depth") or 0) == 0 and it.get("member_path") is None) else 0
             norm = it.get("fields_normalized") or {}
             orig = it.get("fields_original") or {}
             sec_fields = sum(
@@ -315,8 +365,11 @@ def _ensure_reconciled_documents(documents: list[dict[str, Any]]) -> None:
             return (
                 -single_unit,
                 -no_err,
-                -on_disk,
                 -is_native,
+                -arith_ok,
+                -qr_ok,
+                few_reviews,
+                -on_disk,
                 -sec_fields,
                 int(it.get("source_id") or 0),
                 int(it.get("page_start") or 1),
@@ -480,11 +533,79 @@ def _row(
     observed_issuer_name = original.get("issuer_name") or normalized.get("issuer_name") or None
     source_locator = document.get("display_location") or document.get("original_path")
     # El control aritmético de los importes, si se pudo hacer.
+    derived_checks = document.get("derived_checks") or []
     arithmetic = next((
-        check for check in document.get("derived_checks") or []
+        check for check in derived_checks
         if check.get("check") == "arithmetic_total_reconciliation"
         and check.get("method") == "observed_components"
     ), {})
+    padron_chk = next((
+        check for check in derived_checks
+        if check.get("check") == "padron_name_crosscheck"
+    ), {})
+    qr_chk = next((
+        check for check in derived_checks
+        if check.get("check") == "sunat_qr_crosscheck"
+    ), {})
+    igv_chk = next((
+        check for check in derived_checks
+        if check.get("check") == "igv_rate_check"
+    ), {})
+    pdf_chk = next((
+        check for check in derived_checks
+        if check.get("check") == "pdf_expediente_info"
+    ), {})
+    emitter_match_status = padron_chk.get("emitter_status") or (
+        "discrepancia" if document.get("emitter_name_discrepancy") else "no_evaluable"
+    )
+    recipient_match_status = padron_chk.get("recipient_status") or "no_evaluable"
+    qr_crosscheck_status = qr_chk.get("status") or "sin_qr"
+    doc_type_str = str(normalized.get("document_type") or "")
+    rec_role_status = str(document.get("recipient_role_status") or "not_found")
+    rec_match_bool = bool(document.get("recipient_ruc_match", False))
+    igv_rate_status = str(igv_chk.get("status") or "no_evaluable")
+    eff_rate = igv_chk.get("effective_rate")
+
+    # Indicador preliminar de crédito fiscal (nunca sustituye validez oficial CPE ni depósito SPOT).
+    if doc_type_str in {"03", "12", "16"}:
+        apto_cf = "No: Boleta/Ticket/Terrestre (sin crédito fiscal IGV)"
+    elif doc_type_str == "02":
+        apto_cf = "No aplica IGV (Recibo por Honorarios)"
+    elif doc_type_str in {"20", "40"}:
+        apto_cf = "Retención/Percepción (aplicación PDT 621)"
+    elif rec_role_status == "mismatch":
+        apto_cf = "No: RUC receptor distinto del objetivo"
+    elif "emitter_ruc_self" in secondary_fields:
+        apto_cf = "No: RUC emisor coincide con RUC objetivo (posible venta)"
+    elif qr_crosscheck_status == "difiere":
+        apto_cf = "Revisar: discrepancia con QR SUNAT"
+    elif igv_rate_status == "igv_referencial_gratuita":
+        apto_cf = "No: IGV referencial en operación gratuita"
+    elif rec_role_status in {"not_found", "candidate_unassigned"}:
+        apto_cf = "Revisar: RUC receptor no identificado"
+    elif rec_match_bool:
+        apto_cf = "Revisar: RUC OK; pendiente validez CPE y SPOT"
+    else:
+        apto_cf = "Revisar manualmente"
+
+    # Alerta de bancarización (Ley 28194 mod. D. Leg. 1529: >= S/ 2,000 o >= US$ 500)
+    curr_code = str(normalized.get("currency") or "")
+    tot_num = _numeric_or_none(normalized.get("total") or normalized.get("total_a_pagar"))
+    bancarizacion_flag = ""
+    if tot_num is not None:
+        if curr_code == "PEN" and abs(tot_num) >= 2000.0:
+            bancarizacion_flag = "Bancarizar (>= S/ 2,000)"
+        elif curr_code == "USD" and abs(tot_num) >= 500.0:
+            bancarizacion_flag = "Bancarizar (>= US$ 500)"
+        elif curr_code in {"PEN", "USD"}:
+            bancarizacion_flag = "Bajo umbral"
+
+    pdf_size_mb = pdf_chk.get("size_mb")
+    over_10mb_flag = (
+        "Sí (>10 MB)" if pdf_chk.get("over_limit") else ("No" if pdf_chk else None)
+    )
+    linked_supports_str = " | ".join(str(x) for x in (pdf_chk.get("linked_supports") or []))
+
     # Moneda declarada para la detracción, la retención y la percepción; sólo se usa si es una sola.
     settlement_currencies = {}
     for field in SETTLEMENT_FIELDS:
@@ -560,6 +681,7 @@ def _row(
         "emitter_padron_cutoff_date": document.get("emitter_padron_cutoff_date"),
         "emitter_padron_source": document.get("emitter_padron_source"),
         "emitter_name_discrepancy": bool(document.get("emitter_name_discrepancy", False)),
+        "emitter_name_padron_match": emitter_match_status,
         "recipient_role_status": document.get("recipient_role_status", "not_found"),
         "recipient_ruc_original": original.get("recipient_ruc"),
         "recipient_ruc_normalized": normalized.get("recipient_ruc"),
@@ -569,6 +691,8 @@ def _row(
         "recipient_padron_razon_social": document.get("recipient_padron_razon_social"),
         "recipient_padron_estado": document.get("recipient_padron_estado"),
         "recipient_padron_cond_domicilio": document.get("recipient_padron_cond_domicilio"),
+        "recipient_name_padron_match": recipient_match_status,
+        "qr_crosscheck_status": qr_crosscheck_status,
         "third_party_rucs_str": ", ".join(third_party_rucs),
         "document_type_original": original.get("document_type"),
         "document_type_normalized": normalized.get("document_type"),
@@ -581,7 +705,29 @@ def _row(
         "due_date_normalized": normalized.get("due_date"),
         "currency_normalized": normalized.get("currency"),
         "payment_condition_normalized": normalized.get("payment_condition"),
+        "installments_count": normalized.get("installments_count"),
+        "recipient_doc_type": normalized.get("recipient_doc_type"),
         "referenced_document_normalized": normalized.get("referenced_document"),
+        "referenced_documents_str": normalized.get("referenced_documents"),
+        "note_type_code": normalized.get("note_type_code"),
+        "note_type_description": normalized.get("note_type_description"),
+        "purchase_order_ref": normalized.get("purchase_order_ref"),
+        "remision_guide_ref": normalized.get("remision_guide_ref"),
+        "vehicle_plate": normalized.get("vehicle_plate"),
+        "observations_text": normalized.get("observations_text"),
+        "detraccion_rate": normalized.get("detraccion_rate"),
+        "detraccion_code": normalized.get("detraccion_code"),
+        "detraccion_account": normalized.get("detraccion_account"),
+        "support_reference": normalized.get("support_reference"),
+        "tasa_igv_efectiva": eff_rate,
+        "igv_rate_status": igv_rate_status,
+        "apto_credito_fiscal_preliminar": apto_cf,
+        "bancarizacion_flag": bancarizacion_flag,
+        "emitter_padron_estado_corte": document.get("emitter_padron_estado"),
+        "emitter_padron_cond_corte": document.get("emitter_padron_cond_domicilio"),
+        "pdf_size_mb": pdf_size_mb,
+        "over_10mb_flag": over_10mb_flag,
+        "linked_supports_str": linked_supports_str,
         "subtotal_normalized": normalized.get("subtotal"),
         "inafecto_normalized": normalized.get("inafecto"),
         "exonerado_normalized": normalized.get("exonerado"),
@@ -609,7 +755,7 @@ def _row(
         "text_sidecar_path": document.get("text_sidecar_path"),
         "normalized_filename": document.get("normalized_filename"),
         "organized_path": document.get("organized_path"),
-        # Columnas de la hoja "CDP válidos"
+        # Columnas principales de resumen en la hoja cdp_detectados.
         "valid_emitter_ruc": str(normalized.get("emitter_ruc")) if normalized.get("emitter_ruc") else None,
         "valid_issuer_name_observed": observed_issuer_name,
         "valid_document_type": str(normalized.get("document_type")) if normalized.get("document_type") else None,
@@ -648,7 +794,7 @@ def _ajustes_vinculados_rows(
         if normalize_detection_status(doc.get("detection_status")) != DETECTED:
             continue
         norm = doc.get("fields_normalized") or {}
-        if norm.get("document_type") not in {"01", "03"}:
+        if norm.get("document_type") not in {"01", "03", "04", "08", "12", "13", "14"}:
             continue
         issuer = str(norm.get("emitter_ruc") or "")
         ser = str(norm.get("series") or "").upper()
@@ -669,29 +815,47 @@ def _ajustes_vinculados_rows(
             continue
         evidence = doc.get("field_evidence") or {}
         ref_page, ref_excerpt = _first_evidence_info(evidence, "referenced_document", f"pág. {r['page_range']}")
-        # Se busca el comprobante afectado dentro del lote, y dentro del mismo emisor.
-        ref_doc = r["referenced_document_normalized"]
-        affected_present = "Sin referencia leída"
-        affected_locs = ""
-        if ref_doc and "-" in str(ref_doc):
-            parts = str(ref_doc).split("-", 1)
-            ref_ser = parts[0].strip().upper()
-            ref_corr = normalize_correlativo(parts[1].strip()).normalized or parts[1].strip()
-            matched_locs = by_serial.get((r["emitter_ruc_normalized"] or "", ref_ser, ref_corr), [])
-            if matched_locs:
-                affected_present = "Sí"
-                affected_locs = " | ".join(matched_locs)
-            else:
-                affected_present = "No encontrado en lote"
+        # Se busca cada comprobante afectado dentro del lote, y dentro del mismo emisor.
+        raw_refs = str(r.get("referenced_documents_str") or r.get("referenced_document_normalized") or "")
+        ref_list = [item.strip() for item in raw_refs.split(",") if item.strip()]
+        matched_all: list[str] = []
+        for ref_doc in ref_list:
+            if "-" in ref_doc:
+                parts = ref_doc.split("-", 1)
+                ref_ser = parts[0].strip().upper()
+                ref_corr = normalize_correlativo(parts[1].strip()).normalized or parts[1].strip()
+                for loc in by_serial.get((r["emitter_ruc_normalized"] or "", ref_ser, ref_corr), []):
+                    if loc not in matched_all:
+                        matched_all.append(loc)
+        if not ref_list:
+            affected_present = "Sin referencia leída"
+            affected_locs = ""
+        elif matched_all:
+            affected_present = "Sí"
+            affected_locs = " | ".join(matched_all)
+        else:
+            affected_present = "No encontrado en lote"
+            affected_locs = ""
+
+        sign_factor = -1.0 if doc_type == "07" else 1.0
+        note_sign = "-" if doc_type == "07" else "+"
+        grav_val = r.get("importe_gravado")
+        igv_val = r.get("importe_igv")
+        tot_val = r.get("importe_total")
 
         rows.append(
             {
                 **r,
                 "note_type_label": "Nota de crédito" if doc_type == "07" else "Nota de débito",
-                "referenced_document_page": ref_page if ref_doc else "-",
+                "referenced_document_page": ref_page if ref_list else "-",
                 "referenced_document_excerpt": ref_excerpt,
+                "referenced_document_normalized": ", ".join(ref_list) if ref_list else None,
                 "affected_present_in_batch": affected_present,
                 "affected_locations_in_batch": affected_locs,
+                "note_sign": note_sign,
+                "gravado_signed": round(abs(grav_val) * sign_factor, 2) if grav_val is not None else None,
+                "igv_signed": round(abs(igv_val) * sign_factor, 2) if igv_val is not None else None,
+                "total_signed": round(abs(tot_val) * sign_factor, 2) if tot_val is not None else None,
             }
         )
     return rows
@@ -922,9 +1086,38 @@ def _review_rows(
                         }
                     )
 
-        # 3. Revisión de receptor solo cuando el adquirente no fue identificado o su rol está en conflicto
-        # (un adquirente distinto con RUC válido es resultado del filtro, no una alerta de revisión)
-        if r["recipient_role_status"] in {"not_found", "candidate_unassigned"}:
+        # 3. Revisión de receptor: alerta alta si pertenece a otro RUC; media si no se identificó RUC (salvo DNI en Boleta).
+        if r["recipient_role_status"] == "mismatch":
+            ver_page, ver_excerpt = _first_evidence_info(evidence, "recipient_ruc", default_page)
+            rows.append(
+                {
+                    "document_id": r["document_id"],
+                    "finding_type": "ruc_receptor_distinto",
+                    "priority": "alta",
+                    "detection_status": r["detection_status"],
+                    "identity_status": r["identity_status"],
+                    "review_field": "recipient_ruc",
+                    "observed_value": r["recipient_ruc_normalized"] or r["recipient_ruc_original"] or "distinto",
+                    "verification_page": ver_page,
+                    "evidence_excerpt": ver_excerpt or r["detection_excerpt"],
+                    "review_reason": "El RUC adquirente del comprobante NO coincide con el RUC objetivo; riesgo de reparo directo si se deduce crédito fiscal (Art. 19 LIGV).",
+                    "display_location": r["display_location"],
+                    "original_path": r["original_path"],
+                    "container_chain_str": r["container_chain_str"],
+                    "member_path": r["member_path"],
+                    "page_range": r["page_range"],
+                    "candidate_fiscal_key": r["candidate_fiscal_key"],
+                    "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                    "issuer_role_status": r["issuer_role_status"],
+                    "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                    "recipient_role_status": r["recipient_role_status"],
+                    "recipient_ruc_match": r["recipient_ruc_match"],
+                    "document_identity": doc_ident,
+                    "total_normalized": r["total_normalized"],
+                    "candidates_or_evidence": r["candidates_json"],
+                }
+            )
+        elif r["recipient_role_status"] in {"not_found", "candidate_unassigned"}:
             ver_page, ver_excerpt = _first_evidence_info(evidence, "recipient_ruc", default_page)
             rows.append(
                 {
@@ -955,12 +1148,98 @@ def _review_rows(
                 }
             )
 
-        # La hoja de revisión señala tanto lecturas dudosas como diferencias de importes.
+        # 3b. Alertas por RUC ausente en padrón local o posible venta propia mezclada en lote de compras.
+        sec_fields_doc = set(doc.get("secondary_review_fields") or [])
+        for pad_flag, f_type, f_field, f_val, f_reason in (
+            (
+                "emitter_ruc_padron",
+                "ruc_emisor_ausente_en_padron",
+                "emitter_ruc",
+                r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                "El RUC emisor tiene dígito válido pero NO figura en la instantánea local del Padrón RUC SUNAT.",
+            ),
+            (
+                "recipient_ruc_padron",
+                "ruc_receptor_ausente_en_padron",
+                "recipient_ruc",
+                r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                "El RUC receptor tiene dígito válido pero NO figura en la instantánea local del Padrón RUC SUNAT.",
+            ),
+            (
+                "emitter_ruc_self",
+                "posible_venta_propia_en_compras",
+                "emitter_ruc",
+                r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                "El RUC emisor coincide con el RUC objetivo; verifique si se mezcló un comprobante de venta propia.",
+            ),
+        ):
+            if pad_flag in sec_fields_doc:
+                ver_page, ver_excerpt = _first_evidence_info(evidence, f_field, default_page)
+                rows.append(
+                    {
+                        "document_id": r["document_id"],
+                        "finding_type": f_type,
+                        "priority": "alta",
+                        "detection_status": r["detection_status"],
+                        "identity_status": r["identity_status"],
+                        "review_field": f_field,
+                        "observed_value": f_val or "no_observado",
+                        "verification_page": ver_page,
+                        "evidence_excerpt": ver_excerpt or r["detection_excerpt"],
+                        "review_reason": f_reason,
+                        "display_location": r["display_location"],
+                        "original_path": r["original_path"],
+                        "container_chain_str": r["container_chain_str"],
+                        "member_path": r["member_path"],
+                        "page_range": r["page_range"],
+                        "candidate_fiscal_key": r["candidate_fiscal_key"],
+                        "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                        "issuer_role_status": r["issuer_role_status"],
+                        "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                        "recipient_role_status": r["recipient_role_status"],
+                        "recipient_ruc_match": r["recipient_ruc_match"],
+                        "document_identity": doc_ident,
+                        "total_normalized": r["total_normalized"],
+                        "candidates_or_evidence": "",
+                    }
+                )
+
+        # La hoja de revisión señala tanto lecturas dudosas como diferencias de importes y alertas MPV/IGV.
         for chk in doc.get("derived_checks") or []:
+            chk_name = chk.get("check")
+            if chk_name == "pdf_expediente_info" and chk.get("over_limit"):
+                rows.append(
+                    {
+                        "document_id": r["document_id"],
+                        "finding_type": "pdf_supera_10mb_mpv",
+                        "priority": "alta",
+                        "detection_status": r["detection_status"],
+                        "identity_status": r["identity_status"],
+                        "review_field": "archivo_pdf_expediente",
+                        "observed_value": f"{chk.get('size_mb')} MB",
+                        "verification_page": default_page,
+                        "evidence_excerpt": r["organized_path"] or r["normalized_filename"] or "",
+                        "review_reason": f"El PDF exportado pesa {chk.get('size_mb')} MB y supera el límite de 10 MB de Mesa de Partes Virtual (MPV) SUNAT.",
+                        "display_location": r["display_location"],
+                        "original_path": r["original_path"],
+                        "container_chain_str": r["container_chain_str"],
+                        "member_path": r["member_path"],
+                        "page_range": r["page_range"],
+                        "candidate_fiscal_key": r["candidate_fiscal_key"],
+                        "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                        "issuer_role_status": r["issuer_role_status"],
+                        "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                        "recipient_role_status": r["recipient_role_status"],
+                        "recipient_ruc_match": r["recipient_ruc_match"],
+                        "document_identity": doc_ident,
+                        "total_normalized": r["total_normalized"],
+                        "candidates_or_evidence": _json(chk),
+                    }
+                )
+                continue
             if not chk.get("consistent", True):
-                chk_name = chk.get("check")
                 low_confidence = chk_name == "low_ocr_confidence"
-                page_located = chk_name in {"missing_description", "missing_issue_date", "missing_issuer_name"}
+                page_located = chk_name in {"missing_description", "missing_issue_date", "missing_issuer_name", "rhe_retencion_check"}
                 if low_confidence or page_located or (chk_name == "arithmetic_total_reconciliation" and chk.get("method") == "observed_components"):
                     if low_confidence or page_located:
                         ver_page, ver_excerpt = f"pág. {chk['page']}", chk["excerpt"]
@@ -975,6 +1254,7 @@ def _review_rows(
                                 "missing_issue_date": "fecha_de_emision_ausente",
                                 "missing_issuer_name": "razon_social_emisor_ausente",
                                 "arithmetic_total_reconciliation": "revision_secundaria_importes",
+                                "rhe_retencion_check": "rhe_sin_retencion_ni_suspension",
                             }[chk_name],
                             "priority": "media",
                             "detection_status": r["detection_status"],
@@ -987,6 +1267,103 @@ def _review_rows(
                                 f"Los componentes suman {chk.get('expected_total')} "
                                 f"y el total leído es {chk.get('observed_total')}."
                             ),
+                            "display_location": r["display_location"],
+                            "original_path": r["original_path"],
+                            "container_chain_str": r["container_chain_str"],
+                            "member_path": r["member_path"],
+                            "page_range": r["page_range"],
+                            "candidate_fiscal_key": r["candidate_fiscal_key"],
+                            "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                            "issuer_role_status": r["issuer_role_status"],
+                            "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                            "recipient_role_status": r["recipient_role_status"],
+                            "recipient_ruc_match": r["recipient_ruc_match"],
+                            "document_identity": doc_ident,
+                            "total_normalized": r["total_normalized"],
+                            "candidates_or_evidence": _json(chk),
+                        }
+                    )
+                elif chk_name == "igv_rate_check":
+                    ver_page, ver_excerpt = _first_evidence_info(evidence, "igv", default_page)
+                    rows.append(
+                        {
+                            "document_id": r["document_id"],
+                            "finding_type": str(chk.get("status") or "tasa_igv_atipica"),
+                            "priority": "media",
+                            "detection_status": r["detection_status"],
+                            "identity_status": r["identity_status"],
+                            "review_field": "igv",
+                            "observed_value": f"{chk.get('effective_rate')}%" if chk.get("effective_rate") is not None else "atipico",
+                            "verification_page": ver_page,
+                            "evidence_excerpt": ver_excerpt or r["detection_excerpt"],
+                            "review_reason": chk.get("reason") or "Tasa efectiva de IGV fuera de rango esperado.",
+                            "display_location": r["display_location"],
+                            "original_path": r["original_path"],
+                            "container_chain_str": r["container_chain_str"],
+                            "member_path": r["member_path"],
+                            "page_range": r["page_range"],
+                            "candidate_fiscal_key": r["candidate_fiscal_key"],
+                            "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                            "issuer_role_status": r["issuer_role_status"],
+                            "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                            "recipient_role_status": r["recipient_role_status"],
+                            "recipient_ruc_match": r["recipient_ruc_match"],
+                            "document_identity": doc_ident,
+                            "total_normalized": r["total_normalized"],
+                            "candidates_or_evidence": _json(chk),
+                        }
+                    )
+                elif chk_name == "padron_name_crosscheck":
+                    for party_label, status_key, f_name, obs_v, pad_v in (
+                        ("emisor", "emitter_status", "issuer_name", r["issuer_name_normalized"], r["emitter_padron_razon_social"]),
+                        ("receptor", "recipient_status", "recipient_name", r["recipient_name_normalized"], r["recipient_padron_razon_social"]),
+                    ):
+                        if chk.get(status_key) == "discrepancia":
+                            ver_page, ver_excerpt = _first_evidence_info(evidence, f_name, default_page)
+                            rows.append(
+                                {
+                                    "document_id": r["document_id"],
+                                    "finding_type": f"discrepancia_razon_social_{party_label}",
+                                    "priority": "media",
+                                    "detection_status": r["detection_status"],
+                                    "identity_status": r["identity_status"],
+                                    "review_field": f_name,
+                                    "observed_value": obs_v or "no_observado",
+                                    "verification_page": ver_page,
+                                    "evidence_excerpt": ver_excerpt or r["detection_excerpt"],
+                                    "review_reason": (
+                                        f"El nombre del {party_label} observado ({obs_v!r}) difiere del registrado en el padrón ({pad_v!r})."
+                                    ),
+                                    "display_location": r["display_location"],
+                                    "original_path": r["original_path"],
+                                    "container_chain_str": r["container_chain_str"],
+                                    "member_path": r["member_path"],
+                                    "page_range": r["page_range"],
+                                    "candidate_fiscal_key": r["candidate_fiscal_key"],
+                                    "emitter_ruc": r["emitter_ruc_normalized"] or r["emitter_ruc_original"],
+                                    "issuer_role_status": r["issuer_role_status"],
+                                    "recipient_ruc": r["recipient_ruc_normalized"] or r["recipient_ruc_original"],
+                                    "recipient_role_status": r["recipient_role_status"],
+                                    "recipient_ruc_match": r["recipient_ruc_match"],
+                                    "document_identity": doc_ident,
+                                    "total_normalized": r["total_normalized"],
+                                    "candidates_or_evidence": _json(chk),
+                                }
+                            )
+                elif chk_name == "sunat_qr_crosscheck" and chk.get("status") == "difiere":
+                    discs = chk.get("discrepancies") or []
+                    rows.append(
+                        {
+                            "document_id": r["document_id"],
+                            "finding_type": "discrepancia_cotejo_qr",
+                            "priority": "alta",
+                            "detection_status": r["detection_status"],
+                            "identity_status": r["identity_status"],
+                            "review_field": "qr_sunat",
+                            "observed_value": chk.get("qr_summary") or "difiere",
+                            "verification_page": default_page,
+                            "evidence_excerpt": r["identity_excerpt"] or r["detection_excerpt"],
+                            "review_reason": f"Cotejo contra código QR SUNAT difiere: {'; '.join(str(x) for x in discs)}",
                             "display_location": r["display_location"],
                             "original_path": r["original_path"],
                             "container_chain_str": r["container_chain_str"],
@@ -1102,9 +1479,15 @@ def _inventory_and_exclusions_rows(
             }
         )
 
-        # Agregar detalle explícito por cada bloque clasificado como no_cdp (HES, SAP, OC, guía, banco, SUNAT)
+        # Agregar detalle explícito por cada bloque clasificado como no_cdp (HES, SAP, OC, guía, banco, SUNAT, SPOT)
         for d in matched_docs:
             if normalize_detection_status(d.get("detection_status")) == NOT_RECEIPT:
+                sup_ref = (d.get("fields_normalized") or {}).get("support_reference")
+                sup_label = str(d.get("non_receipt_type") or "soporte_no_fiscal")
+                if sup_ref:
+                    sup_label = f"{sup_label} ({sup_ref})"
+                org_path = d.get("organized_path")
+                action_label = f"linked_to_cdp ({org_path})" if (org_path and "_SOPORTES_" in str(org_path)) else "excluded_from_cdp_results"
                 rows.append(
                     {
                         "source_id": sid,
@@ -1118,9 +1501,9 @@ def _inventory_and_exclusions_rows(
                         "detected_format": d.get("source_format"),
                         "inventory_status": "excluded_non_cdp_support",
                         "detection_status": NOT_RECEIPT,
-                        "exclusion_or_support_type": d.get("non_receipt_type") or "soporte_no_fiscal",
+                        "exclusion_or_support_type": sup_label,
                         "status_reason": d.get("detection_reason") or d.get("decision_comment") or "",
-                        "action_taken": "excluded_from_cdp_results",
+                        "action_taken": action_label,
                         "byte_size": inv.get("byte_size", 0),
                         "compressed_size": inv.get("compressed_size"),
                     }
@@ -1208,7 +1591,7 @@ def _style_and_populate_sheet(
             if label in text_columns and value is not None:
                 cell.number_format = "@"
             elif label in numeric_cols and isinstance(value, (int, float)):
-                cell.number_format = "#,##0.00"
+                cell.number_format = "#,##0.00##" if label == "Cantidad" else "#,##0.00"
             elif key in DATE_KEYS and isinstance(value, (date, datetime)):
                 cell.number_format = DATE_FORMAT
 
@@ -1265,6 +1648,78 @@ def save_workbook(workbook: Workbook, path: Path) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return path.resolve()
+
+
+# Columnas de la hoja detalle_items: desglose de productos o servicios leídos en cada comprobante.
+DETAIL_ITEMS_COLUMNS: list[tuple[str, str]] = [
+    ("ID documento", "document_id"),
+    ("Clave fiscal", "candidate_fiscal_key"),
+    ("RUC emisor", "emitter_ruc"),
+    ("Razón social emisor", "issuer_name"),
+    ("Tipo", "document_type"),
+    ("Serie", "series"),
+    ("Correlativo", "correlativo"),
+    ("Fecha emisión", "issue_date"),
+    ("Ítem", "item_index"),
+    ("Código", "code"),
+    ("Descripción", "description"),
+    ("Cantidad", "quantity"),
+    ("Unidad", "unit"),
+    ("Valor unitario", "unit_price"),
+    ("Descuento línea", "discount"),
+    ("Importe línea", "line_total"),
+    ("Moneda", "currency"),
+    ("Página", "page_number"),
+    ("Archivo de origen", "source_locator"),
+]
+
+
+def _detalle_items_rows(documents: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for doc in documents:
+        if normalize_detection_status(doc.get("detection_status"), read_error=bool(doc.get("read_error"))) != DETECTED:
+            continue
+        if doc.get("key_reconciliation_status") in {"concordante_secundario", "ajuste_concordante_secundario"}:
+            continue
+        norm = doc.get("fields_normalized") or {}
+        orig = doc.get("fields_original") or {}
+        source_locator = doc.get("display_location") or doc.get("original_path")
+        for it in doc.get("line_items") or []:
+            qty_num = _numeric_or_none(it.get("quantity_normalized"))
+            qty_val = qty_num if qty_num is not None else it.get("quantity_observed")
+            rows.append(
+                {
+                    "document_id": doc.get("id"),
+                    "candidate_fiscal_key": _compute_candidate_key(doc),
+                    "emitter_ruc": str(norm.get("emitter_ruc")) if norm.get("emitter_ruc") else None,
+                    "issuer_name": orig.get("issuer_name") or norm.get("issuer_name"),
+                    "document_type": str(norm.get("document_type")) if norm.get("document_type") else None,
+                    "series": str(norm.get("series")) if norm.get("series") else None,
+                    "correlativo": str(norm.get("correlativo_normalized")) if norm.get("correlativo_normalized") else None,
+                    "issue_date": norm.get("issue_date"),
+                    "item_index": it.get("item_index"),
+                    "code": it.get("code"),
+                    "description": it.get("description_normalized") or it.get("description_observed"),
+                    "quantity": qty_val,
+                    "unit": it.get("unit_normalized") or it.get("unit_observed"),
+                    "unit_price": _numeric_or_none(it.get("unit_price_normalized")),
+                    "discount": _numeric_or_none(it.get("discount_normalized")),
+                    "line_total": _numeric_or_none(it.get("line_total_normalized")),
+                    "currency": norm.get("currency"),
+                    "page_number": str(it.get("page_number") or doc.get("page_start") or 1),
+                    "source_locator": source_locator,
+                }
+            )
+    rows.sort(
+        key=lambda row: (
+            row["emitter_ruc"] or "",
+            row["series"] or "",
+            row["correlativo"] or "",
+            int(row["document_id"] or 0),
+            int(row["item_index"] or 0),
+        )
+    )
+    return rows
 
 
 # Punto de entrada: arma CDP.xlsx a partir de la base de la corrida.
@@ -1330,54 +1785,98 @@ def export_results(
     status = summary.run_status if summary else run_details.get("run_status", "sin estado guardado")
 
     # Paso 5: columnas de la hoja principal. Se omite la fecha de verificación y se añaden identidad,
-    # copias, lectura, padrón y evidencias.
+    # copias, lectura, cotejo bidireccional con padrón (estado/condición referencial al corte), detalle, alertas y evidencias.
     detected_columns = [
         *(column for column in CDP_VALIDOS_COLUMNS if column[1] != "official_validation_date"),
+        ("Cantidad de ítems", "line_items_count"),
         ("Identidad", "identity_status"),
+        ("Requiere revisión humana", "requires_human_review"),
+        ("Alertas / Observaciones", "observations"),
         ("Cotejo de duplicados", "key_reconciliation_status"),
         ("Representaciones", "representaciones_misma_clave"),
         ("Coincide RUC objetivo", "recipient_ruc_match"),
+        ("Cotejo QR SUNAT", "qr_crosscheck_status"),
         ("Lectura", "reading_source"),
         ("Razón social del padrón", "emitter_padron_razon_social"),
+        ("Cotejo nombre emisor", "emitter_name_padron_match"),
+        ("Estado padrón (corte)", "emitter_padron_estado_corte"),
+        ("Condición domicilio (corte)", "emitter_padron_cond_corte"),
+        ("Razón social receptor observada", "recipient_name_normalized"),
+        ("Razón social receptor del padrón", "recipient_padron_razon_social"),
+        ("Cotejo nombre receptor", "recipient_name_padron_match"),
         ("Fecha de corte del padrón", "emitter_padron_cutoff_date"),
+        ("Archivo PDF ordenado", "normalized_filename"),
+        ("Ruta PDF expediente", "organized_path"),
+        ("Peso PDF (MB)", "pdf_size_mb"),
+        ("Supera 10 MB MPV", "over_10mb_flag"),
+        ("Anexos mismo PDF", "linked_supports_str"),
         ("Buen contribuyente visible", "buen_contribuyente_visible"),
         ("Evidencia de leyendas", "visible_tax_evidence"),
         ("Evidencia de la denominación", "document_title_evidence"),
     ]
+    detail_rows = _detalle_items_rows(documents)
+    exported_pdfs_count = sum(1 for doc in documents if doc.get("organized_path"))
+    mismatch_ruc_count = sum(1 for row in detected_rows if row.get("recipient_role_status") == "mismatch")
+    human_review_cdp_count = sum(1 for row in detected_rows if row.get("requires_human_review"))
+    over_10mb_count = sum(
+        1 for doc in documents
+        if any(chk.get("check") == "pdf_expediente_info" and chk.get("over_limit") for chk in (doc.get("derived_checks") or []))
+    )
     # Paso 6: indicadores de la hoja resumen. «CDP confirmados oficialmente» es siempre 0 porque no hay consulta a SUNAT.
     metrics = [
         ("Estado de corrida", status),
         ("RUC receptor objetivo", run.get("target_recipient_ruc")),
         ("Representaciones CDP detectadas", len(cdp)),
         ("Filas en CDP detectados", len(detected_rows)),
+        ("CDP con RUC receptor distinto del objetivo", mismatch_ruc_count),
+        ("CDP que requieren revisión humana", human_review_cdp_count),
+        ("Ítems de detalle extraídos", len(detail_rows)),
+        ("PDFs exportados al expediente", exported_pdfs_count),
+        ("PDFs que superan 10 MB (límite MPV SUNAT)", over_10mb_count),
         ("CDP confirmados oficialmente", 0),
         ("Notas de crédito y débito", len(adjustments)),
         ("Hallazgos para revisar", len(review)),
         ("Canal oficial de validación", "Sin conexión a consulta oficial"),
+        ("Alcance: validez de emisión CPE", "Esta herramienta NO consulta Clave SOL ni API CPE de SUNAT; estado_oficial siempre pendiente."),
+        ("Alcance: padrón RUC (HABIDO/ACTIVO)", "El padrón local es estático a su fecha de corte; NO acredita condición a la fecha de emisión."),
+        ("Alcance: crédito fiscal y gasto", "No acredita fehaciencia, depósito SPOT (D. Leg. 940) ni bancarización (Ley 28194); validar Art. 18 y 19 LIGV."),
     ]
     # Paso 7: crear el libro y escribir las hojas (sin las columnas de soporte que no hacen falta) y, al final, el resumen.
     workbook = Workbook()
     workbook.remove(workbook.active)
-    text_columns = {"RUC emisor", "RUC adquirente", "Tipo", "Serie", "Correlativo", "Página"}
-    # Las columnas de soporte se reducen a las necesarias para volver al original.
+    text_columns = {"RUC emisor", "RUC adquirente", "Tipo", "Serie", "Correlativo", "Código", "Página", "Código motivo SUNAT", "Código SPOT", "Cuenta BN detracción", "Tipo nota", "Serie nota", "Correlativo nota", "Tipo-Serie-Correlativo", "Tipo doc. adquirente", "Archivo PDF ordenado"}
+    numeric_cols = {
+        *(label for label, key in (*AMOUNTS_EXPORT, *SETTLEMENT_EXPORT) if key.startswith("importe_")),
+        "Base gravada con signo",
+        "IGV con signo",
+        "Total con signo",
+        "Tasa IGV efectiva (%)",
+        "Peso PDF (MB)",
+        "Cantidad",
+        "Valor unitario",
+        "Descuento línea",
+        "Importe línea",
+    }
+    # Conservamos ID documento en todas las hojas de comprobantes para trazabilidad cruzada 1-a-1.
     for title, columns, rows in (
         ("cdp_detectados", detected_columns, detected_rows),
         ("notas", [column for column in AJUSTES_COLUMNS if column[1] not in {
-            "document_id", "original_path", "container_chain_str", "member_path",
+            "original_path", "container_chain_str", "member_path",
             "detection_status", "candidate_fiscal_key", "note_type_label",
         }], adjustments),
         ("revision", [column for column in REVIEW_COLUMNS if column[1] not in {
-            "document_id", "original_path", "container_chain_str", "member_path",
+            "original_path", "container_chain_str", "member_path",
             "recipient_ruc_match", "candidates_or_evidence",
         }], review),
         ("inventario", [column for column in INVENTORY_COLUMNS if column[1] not in {
             "source_id", "source_path", "container_chain_str", "member_path", "nested_depth",
             "byte_size", "compressed_size",
         }], inventory_rows),
+        ("detalle_items", DETAIL_ITEMS_COLUMNS, detail_rows),
     ):
         _style_and_populate_sheet(
             workbook.create_sheet(title), columns, rows, text_columns,
-            numeric_columns={label for label, key in (*AMOUNTS_EXPORT, *SETTLEMENT_EXPORT) if key.startswith("importe_")},
+            numeric_columns=numeric_cols,
             normalizar_encabezados=True,
         )
     resumen = workbook.create_sheet("resumen")
@@ -1388,5 +1887,3 @@ def export_results(
     )
     # Paso 8: guardar CDP.xlsx en la carpeta de salida.
     return save_workbook(workbook, Path(output_root) / OUTPUT_FILENAME)
-
-

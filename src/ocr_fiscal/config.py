@@ -1,3 +1,5 @@
+"""Carga y validación de ajustes de lectura desde config.json."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -28,7 +30,7 @@ class AppConfig:
     render_dpi: int = 220
     # Tamaño máximo de imagen admitido. Las que lo superan se dejan en revisión.
     max_pixels: int = 40_000_000
-    # Si es True, se vuelve a leer el cuadro de importes recortado (sólo en escaneos de una página).
+    # Si es True, se vuelve a leer el cuadro de importes recortado.
     read_amount_panel: bool = False
     # Tipos de comprobante que se buscan (código SUNAT -> nombre). Por defecto, los de models.py.
     document_types: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_DOCUMENT_TYPES))
@@ -38,6 +40,10 @@ class AppConfig:
     inspect_archives: bool = True
     # Abrir también los ZIP que vienen dentro de otros ZIP.
     inspect_nested_archives: bool = True
+    # Si es True, genera el expediente ordenado en PDF por proveedor (<RUC> - <Nombre>).
+    export_pdf_folders: bool = False
+    # Longitud máxima de la parte del nombre del proveedor en subcarpetas (para evitar rutas largas en Windows).
+    max_provider_folder_name_len: int = 45
     # Extensiones que se tratan como contenedores.
     archive_extensions: tuple[str, ...] = (".zip",)
     # Topes de seguridad al abrir ZIP, para no caer en archivos malintencionados o "bombas":
@@ -53,8 +59,12 @@ class AppConfig:
     explicit_render_dpi_metadata: bool = True
     # Base local del padrón RUC (SQLite) para contrastar la razón social. None = sin padrón.
     padron_db_path: Path | None = None
-    # Antigüedad máxima del padrón, en días. Ningún ajuste de config.json lo cambia: queda en None (sin límite).
+    # Antigüedad máxima del padrón, en días. None = sin límite.
     padron_max_age_days: int | None = None
+    # Unifica Notas de Crédito/Débito (07/08) dentro de la misma carpeta del proveedor en 01_cdp_por_proveedor.
+    unify_notes_by_provider: bool = True
+    # Tolerancia máxima de redondeo (en moneda del documento) para aceptar el cuadre de importes como cuadre con redondeo.
+    rounding_tolerance: float = 0.02
 
 
 # Lee el archivo de ajustes, lo valida y devuelve un AppConfig.
@@ -81,7 +91,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         "maximo_pixeles": defaults.max_pixels,
         "releer_recuadro_importes": defaults.read_amount_panel,
         "revisar_archivos_zip": defaults.inspect_archives,
+        "exportar_pdf_ordenado": defaults.export_pdf_folders,
         "padron_ruc": None,
+        "padron_dias_maximos": defaults.padron_max_age_days,
+        "unificar_notas_en_proveedor": defaults.unify_notes_by_provider,
+        "tolerancia_redondeo": defaults.rounding_tolerance,
     }
     # Paso 3: rechazar nombres de ajuste desconocidos (por ejemplo, un error de tipeo) antes de seguir.
     unknown = sorted(raw.keys() - settings.keys())
@@ -107,18 +121,30 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     executable = settings["ruta_tesseract"]
     languages = settings["idiomas_ocr"]
     inspect_zips = settings["revisar_archivos_zip"]
+    export_pdfs = settings["exportar_pdf_ordenado"]
     read_amount_panel = settings["releer_recuadro_importes"]
     padron = settings["padron_ruc"]
+    padron_days = settings["padron_dias_maximos"]
+    unify_notes = settings["unificar_notas_en_proveedor"]
+    rounding_tol = settings["tolerancia_redondeo"]
     if not isinstance(executable, str) or not executable.strip():
         raise ValueError('ruta_tesseract debe ser "auto" o una ruta escrita entre comillas.')
     if not isinstance(languages, str) or not re.fullmatch(r"[\w/]+(?:\+[\w/]+)*", languages):
         raise ValueError('idiomas_ocr debe tener un formato como "spa" o "spa+eng".')
     if type(inspect_zips) is not bool:
         raise ValueError("revisar_archivos_zip debe ser true o false.")
+    if type(export_pdfs) is not bool:
+        raise ValueError("exportar_pdf_ordenado debe ser true o false.")
     if type(read_amount_panel) is not bool:
         raise ValueError("releer_recuadro_importes debe ser true o false.")
+    if type(unify_notes) is not bool:
+        raise ValueError("unificar_notas_en_proveedor debe ser true o false.")
     if padron is not None and (not isinstance(padron, str) or not padron.strip()):
         raise ValueError("padron_ruc debe ser null o una ruta escrita entre comillas.")
+    if padron_days is not None and (type(padron_days) is not int or padron_days < 1):
+        raise ValueError("padron_dias_maximos debe ser null o un entero mayor o igual a 1.")
+    if type(rounding_tol) not in {int, float} or rounding_tol < 0 or rounding_tol > 0.5:
+        raise ValueError("tolerancia_redondeo debe ser un número entre 0 y 0.5.")
 
     # Una ruta relativa se interpreta desde el archivo de ajustes que la declara.
     directory = config_path.resolve().parent
@@ -136,5 +162,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         read_amount_panel=read_amount_panel,
         inspect_archives=inspect_zips,
         inspect_nested_archives=inspect_zips,
+        export_pdf_folders=export_pdfs,
         padron_db_path=directory / Path(padron).expanduser() if padron is not None else None,
+        padron_max_age_days=padron_days,
+        unify_notes_by_provider=unify_notes,
+        rounding_tolerance=float(rounding_tol),
     )

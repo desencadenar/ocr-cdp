@@ -13,7 +13,16 @@ DEFAULT_DOCUMENT_TYPES: dict[str, str] = {
     "05": "Boleto de transporte aéreo",
     "07": "Nota de crédito",
     "08": "Nota de débito",
+    "10": "Recibo por arrendamiento",
     "12": "Ticket de máquina registradora",
+    "13": "Documento autorizado SBS",
+    "14": "Recibo por servicios públicos",
+    "16": "Boleto de viaje terrestre",
+    "20": "Comprobante de retención",
+    "40": "Comprobante de percepción",
+    "50": "Declaración Aduanera de Mercancías (DUA/DAM)",
+    "52": "Despacho simplificado aduanero",
+    "54": "Liquidación de cobranza aduanera",
 }
 
 # Estados posibles al decidir si un bloque de página es un comprobante de pago (CDP).
@@ -334,6 +343,8 @@ class LineItem:
     unit_normalized: str | None = None
     unit_price_observed: str | None = None
     unit_price_normalized: str | None = None
+    discount_observed: str | None = None
+    discount_normalized: str | None = None
     line_total_observed: str | None = None
     line_total_normalized: str | None = None
     page_number: int = 1
@@ -358,6 +369,8 @@ class LineItem:
             "unit_normalized": self.unit_normalized,
             "unit_price_observed": self.unit_price_observed,
             "unit_price_normalized": self.unit_price_normalized,
+            "discount_observed": self.discount_observed,
+            "discount_normalized": self.discount_normalized,
             "line_total_observed": self.line_total_observed,
             "line_total_normalized": self.line_total_normalized,
             "page_number": self.page_number,
@@ -415,8 +428,21 @@ class ExtractionResult:
     total_a_pagar: str | None = None
     # --- Otros datos ---
     payment_condition: str | None = None
+    installments_count: str | None = None
     referenced_document: str | None = None
+    referenced_documents: list[str] = field(default_factory=list)
+    note_type_code: str | None = None
+    note_type_description: str | None = None
     general_description: str | None = None
+    observations_text: str | None = None
+    recipient_doc_type: str | None = None
+    purchase_order_ref: str | None = None
+    remision_guide_ref: str | None = None
+    vehicle_plate: str | None = None
+    detraccion_rate: str | None = None
+    detraccion_code: str | None = None
+    detraccion_account: str | None = None
+    support_reference: str | None = None
     # --- Decisiones del programa: ¿es un comprobante?, ¿está completa su identidad? ---
     detection_status: str = AMBIGUOUS
     identity_status: str = IDENTITY_NOT_APPLICABLE
@@ -512,8 +538,21 @@ class ExtractionResult:
             "total": self.total,
             "total_a_pagar": self.total_a_pagar,
             "payment_condition": self.payment_condition,
+            "installments_count": self.installments_count,
             "referenced_document": self.referenced_document,
+            "referenced_documents": ",".join(self.referenced_documents) if self.referenced_documents else None,
+            "note_type_code": self.note_type_code,
+            "note_type_description": self.note_type_description,
             "general_description": self.general_description,
+            "observations_text": self.observations_text,
+            "recipient_doc_type": self.recipient_doc_type,
+            "purchase_order_ref": self.purchase_order_ref,
+            "remision_guide_ref": self.remision_guide_ref,
+            "vehicle_plate": self.vehicle_plate,
+            "detraccion_rate": self.detraccion_rate,
+            "detraccion_code": self.detraccion_code,
+            "detraccion_account": self.detraccion_account,
+            "support_reference": self.support_reference,
             "third_party_rucs": ",".join(self.third_party_rucs) if self.third_party_rucs else None,
             "candidate_fiscal_key": self.candidate_fiscal_key,
             "identity_status": self.identity_status,
