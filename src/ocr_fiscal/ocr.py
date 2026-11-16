@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import threading
 from typing import Protocol
 
 from .models import LayoutLine
@@ -61,6 +63,7 @@ class TesseractOCREngine:
         self._resolved: str | None = None
         self.version = "unknown"
         self._availability_cache: tuple[bool, str | None] | None = None
+        self._availability_lock = threading.Lock()
         # Registramos las sondas de versión/idiomas por separado de las invocaciones de reconocimiento por página.
         self.probe_invocations: int = 0
         self.recognition_invocations: int = 0
@@ -100,80 +103,114 @@ class TesseractOCREngine:
     # Comprueba, una sola vez (el resultado queda en memoria), que Tesseract arranca y tiene los idiomas pedidos.
     # Devuelve (está_disponible, motivo_si_no).
     def availability(self) -> tuple[bool, str | None]:
-        if self._availability_cache is not None:
-            return self._availability_cache
-        # Paso 1: encontrar el ejecutable.
+        with self._availability_lock:
+            if self._availability_cache is not None:
+                return self._availability_cache
+            # Paso 1: encontrar el ejecutable.
+            executable = self._resolve()
+            if executable is None:
+                self._availability_cache = (False, "Tesseract no está instalado o no se encuentra en PATH")
+                return self._availability_cache
+            try:
+                self.probe_invocations += 1
+                # Paso 2: preguntarle la versión. Si no responde bien, se da por no disponible.
+                version = subprocess.run(
+                    [executable, "--version"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=min(self.timeout_seconds, 10),
+                    check=False,
+                )
+                self.probe_events.append(
+                    {
+                        "probe": "version",
+                        "executable": executable,
+                        "returncode": version.returncode,
+                        "status": "succeeded" if version.returncode == 0 else "failed",
+                    }
+                )
+                if version.returncode != 0:
+                    self._availability_cache = (False, version.stderr.strip() or "Tesseract no pudo iniciar")
+                    return self._availability_cache
+                self.version = (version.stdout or version.stderr).splitlines()[0].strip()
+                self.probe_invocations += 1
+                # Paso 3: pedirle la lista de idiomas y comprobar que están todos los que hacen falta (por ejemplo spa y eng).
+                languages = subprocess.run(
+                    [executable, "--list-langs"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=min(self.timeout_seconds, 10),
+                    check=False,
+                )
+                available_languages = set(languages.stdout.splitlines()[1:])
+                missing = [language for language in self.languages.split("+") if language not in available_languages]
+                self.probe_events.append(
+                    {
+                        "probe": "languages",
+                        "executable": executable,
+                        "returncode": languages.returncode,
+                        "status": "succeeded" if languages.returncode == 0 and not missing else "failed",
+                        "requested": self.languages,
+                        "missing": missing,
+                    }
+                )
+                if languages.returncode != 0:
+                    self._availability_cache = (False, languages.stderr.strip() or "No se pudo leer la lista de idiomas de Tesseract")
+                    return self._availability_cache
+                if missing:
+                    self._availability_cache = (False, f"Faltan datos de idioma Tesseract: {', '.join(missing)}")
+                    return self._availability_cache
+                self._availability_cache = (True, None)
+                return self._availability_cache
+            # Cualquier fallo al comprobarlo se anota como «no disponible», con su motivo.
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self.probe_events.append(
+                    {
+                        "probe": "availability_exception",
+                        "executable": executable,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                self._availability_cache = (False, f"No se pudo comprobar Tesseract: {exc}")
+                return self._availability_cache
+
+    def detect_orientation(self, image_path: str | Path) -> int | None:
+        """Detecta ángulo de rotación en sentido horario (0, 90, 180, 270) usando OSD de Tesseract (--psm 0)."""
+        available, _ = self.availability()
+        if not available:
+            return None
         executable = self._resolve()
         if executable is None:
-            self._availability_cache = (False, "Tesseract no está instalado o no se encuentra en PATH")
-            return self._availability_cache
+            return None
         try:
-            self.probe_invocations += 1
-            # Paso 2: preguntarle la versión. Si no responde bien, se da por no disponible.
-            version = subprocess.run(
-                [executable, "--version"],
+            completed = subprocess.run(
+                [executable, str(image_path), "stdout", "--psm", "0"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=min(self.timeout_seconds, 10),
+                timeout=min(self.timeout_seconds, 20),
                 check=False,
             )
-            self.probe_events.append(
-                {
-                    "probe": "version",
-                    "executable": executable,
-                    "returncode": version.returncode,
-                    "status": "succeeded" if version.returncode == 0 else "failed",
-                }
-            )
-            if version.returncode != 0:
-                self._availability_cache = (False, version.stderr.strip() or "Tesseract no pudo iniciar")
-                return self._availability_cache
-            self.version = (version.stdout or version.stderr).splitlines()[0].strip()
-            self.probe_invocations += 1
-            # Paso 3: pedirle la lista de idiomas y comprobar que están todos los que hacen falta (por ejemplo spa y eng).
-            languages = subprocess.run(
-                [executable, "--list-langs"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=min(self.timeout_seconds, 10),
-                check=False,
-            )
-            available_languages = set(languages.stdout.splitlines()[1:])
-            missing = [language for language in self.languages.split("+") if language not in available_languages]
-            self.probe_events.append(
-                {
-                    "probe": "languages",
-                    "executable": executable,
-                    "returncode": languages.returncode,
-                    "status": "succeeded" if languages.returncode == 0 and not missing else "failed",
-                    "requested": self.languages,
-                    "missing": missing,
-                }
-            )
-            if languages.returncode != 0:
-                self._availability_cache = (False, languages.stderr.strip() or "No se pudo leer la lista de idiomas de Tesseract")
-                return self._availability_cache
-            if missing:
-                self._availability_cache = (False, f"Faltan datos de idioma Tesseract: {', '.join(missing)}")
-                return self._availability_cache
-            self._availability_cache = (True, None)
-            return self._availability_cache
-        # Cualquier fallo al comprobarlo se anota como «no disponible», con su motivo.
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            self.probe_events.append(
-                {
-                    "probe": "availability_exception",
-                    "executable": executable,
-                    "status": "failed",
-                    "error": str(exc),
-                }
-            )
-            self._availability_cache = (False, f"No se pudo comprobar Tesseract: {exc}")
-            return self._availability_cache
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        text_out = f"{completed.stdout}\n{completed.stderr}"
+        rot_match = re.search(r"Rotate:\s*(0|90|180|270)\b", text_out)
+        conf_match = re.search(r"Orientation\s+confidence:\s*([0-9]+(?:\.[0-9]+)?)", text_out)
+        if not rot_match:
+            return None
+        rot = int(rot_match.group(1))
+        conf = float(conf_match.group(1)) if conf_match else 0.0
+        if rot in {90, 180, 270} and conf >= 1.5:
+            return rot
+        return None
 
     # Lee una imagen con Tesseract y devuelve texto, confianza y líneas con su posición.
     # El modo de segmentación 3 es el de página completa; el 6 se usa para recuadros.

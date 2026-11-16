@@ -1,3 +1,5 @@
+"""Utilidades para medir y comparar distintos perfiles de configuración contra una muestra revisada a mano."""
+
 from __future__ import annotations
 
 from collections import Counter

@@ -48,21 +48,31 @@ def validate_ruc(value: str) -> RucValidation:
     )
 
 
+# Tipos documentales cuyo correlativo o número de boleto/declaración puede superar los 8 dígitos estándar.
+_EXTENDED_CORRELATIVO_TYPES = frozenset({"05", "10", "12", "13", "14", "16", "50", "52", "54"})
+
+
+def validate_dni(value: str) -> bool:
+    """Comprueba que un DNI peruano tenga exactamente 8 dígitos ASCII."""
+    return bool(re.fullmatch(r"[0-9]{8}", str(value).strip()))
+
+
 # Deja el correlativo en 8 dígitos con ceros a la izquierda ("169" pasa a "00000169").
-# Si no es numérico o tiene más de 8 dígitos no lo toca, y explica por qué en el resultado.
-def normalize_correlativo(value: str | None) -> NormalizationResult:
+# Para boletos/tickets/recibos/DUA que superan 8 dígitos conserva los dígitos sin truncar;
+# en tipos estándar (01, 02, 03, 04, 07, 08, 20, 40) exige entre 1 y 8 dígitos.
+def normalize_correlativo(value: str | None, *, document_type: str | None = None) -> NormalizationResult:
     # Sin correlativo no hay nada que normalizar.
     if value is None:
         return NormalizationResult(None, None, False, "correlativo ausente")
     # Guardamos el texto original tal cual para poder mostrarlo, y trabajamos con una copia sin espacios.
     original = str(value)
     candidate = original.strip()
-    # Si no son de 1 a 8 dígitos, se rechaza. Un correlativo demasiado largo no se recorta: se avisa.
-    if not re.fullmatch(r"[0-9]{1,8}", candidate):
-        reason = "correlativo debe tener entre 1 y 8 dígitos ASCII"
-        if len(candidate) > 8 and candidate.isascii() and candidate.isdigit():
-            reason = "correlativo supera 8 dígitos; no se trunca"
+    max_digits = 20 if document_type in _EXTENDED_CORRELATIVO_TYPES else 8
+    if not re.fullmatch(rf"[0-9]{{1,{max_digits}}}", candidate):
+        reason = f"correlativo debe tener entre 1 y {max_digits} dígitos ASCII"
+        if len(candidate) > max_digits and candidate.isascii() and candidate.isdigit():
+            reason = f"correlativo supera {max_digits} dígitos; no se trunca"
         return NormalizationResult(original, None, False, reason)
-    # Caso normal: rellenamos con ceros hasta llegar a 8 dígitos.
-    return NormalizationResult(original, candidate.zfill(8), True)
-
+    # Si tiene hasta 8 dígitos rellenamos con ceros; si supera 8 (p. ej. boleto aéreo IATA) se conserva completo.
+    normalized = candidate.zfill(8) if len(candidate) <= 8 else candidate
+    return NormalizationResult(original, normalized, True)

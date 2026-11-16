@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import io
 import json
 from pathlib import Path
@@ -27,10 +29,42 @@ PADRON_FORMATO_INVALIDO = "formato_invalido"
 _BATCH_SQL_PARAM_LIMIT = 900
 # Para comparar nombres se dejan sólo letras y números.
 _NAME_CLEAN_RE = re.compile(r"[^A-Z0-9ÁÉÍÓÚÑ]+")
-# Formas societarias que se ignoran al comparar nombres (S.A.C., S.R.L., E.I.R.L., etc.).
+# Formas societarias que se ignoran al comparar nombres (S.A.C., S.C.R.L., S.A.C.S., E.I.R.L., etc.).
 _CORP_SUFFIX_RE = re.compile(
-    r"\b(S\.?A\.?C\.?|S\.?A\.?A\.?|S\.?A\.?|S\.?R\.?L\.?|E\.?I\.?R\.?L\.?|SUCURSAL DEL PERU|SOCIEDAD ANONIMA CERRADA|SOCIEDAD ANONIMA)\b"
+    r"\b("
+    r"S\.?\s*A\.?\s*C\.?\s*I\.?|"
+    r"S\.?\s*A\.?\s*C\.?\s*S\.?|"
+    r"S\.?\s*A\.?\s*C\.?|"
+    r"S\.?\s*A\.?\s*A\.?|"
+    r"S\.?\s*C\.?\s*R\.?\s*L\.?|"
+    r"S\.?\s*CIVIL\s+DE\s+R\.?\s*L\.?|"
+    r"S\.?\s*R\.?\s*L\.?|"
+    r"E\.?\s*I\.?\s*R\.?\s*L\.?|"
+    r"S\.?\s*C\.?|"
+    r"S\.?\s*A\.?|"
+    r"SUCURSAL\s+DEL\s+PERU|"
+    r"SOCIEDAD\s+ANONIMA\s+CERRADA|"
+    r"SOCIEDAD\s+ANONIMA\s+ABIERTA|"
+    r"SOCIEDAD\s+ANONIMA|"
+    r"SOCIEDAD\s+COMERCIAL\s+DE\s+RESPONSABILIDAD\s+LIMITADA|"
+    r"EMPRESA\s+INDIVIDUAL\s+DE\s+RESPONSABILIDAD\s+LIMITADA|"
+    r"DEL\s+PERU"
+    r")\b"
 )
+
+_ABBREV_TOKEN_MAP: dict[str, str] = {
+    "CIA": "COMPANIA",
+    "IND": "INDUSTRIAS",
+    "SERV": "SERVICIOS",
+    "SERVS": "SERVICIOS",
+    "TRANSP": "TRANSPORTES",
+    "DIST": "DISTRIBUIDORA",
+    "INM": "INMOBILIARIA",
+    "CORP": "CORPORACION",
+    "IMP": "IMPORTACIONES",
+    "EXP": "EXPORTACIONES",
+    "COM": "COMERCIAL",
+}
 
 
 # Deja un nombre en forma comparable: mayúsculas, sin tildes, sin forma societaria y sin puntuación.
@@ -44,26 +78,72 @@ def _normalize_company_name(value: str | None) -> str:
         .replace("Í", "I")
         .replace("Ó", "O")
         .replace("Ú", "U")
+        .replace("Ü", "U")
     )
+    upper = re.sub(r"\s*&\s*", " Y ", upper)
     upper = _CORP_SUFFIX_RE.sub(" ", upper)
-    tokens = [tok for tok in _NAME_CLEAN_RE.split(upper) if tok]
+    tokens = [_ABBREV_TOKEN_MAP.get(tok, tok) for tok in _NAME_CLEAN_RE.split(upper) if tok]
     return " ".join(tokens)
 
 
-# ¿El nombre leído en el comprobante contradice al del padrón? Sólo da True si ambos existen y son distintos.
-# Un nombre abreviado que está contenido en el otro no cuenta como discrepancia.
-def names_disagree(observed_name: str | None, padron_name: str | None) -> bool:
-    """Devuelve True solo cuando ambos nombres existen y difieren tras normalizar puntuación y sufijos societarios."""
+def compare_names_with_padron(
+    observed_name: str | None,
+    padron_name: str | None,
+    *,
+    ruc: str | None = None,
+) -> tuple[str, float]:
+    """Compara una razón social observada contra la del padrón local.
+
+    Devuelve `(estado, similitud)` con uno de estos cinco estados:
+    - `no_evaluable`: falta alguno de los dos nombres.
+    - `coincide_exacto`: coincidencia exacta, abreviatura contenida u orden invertido exacto en persona natural.
+    - `coincide_con_ruido_ocr`: diferencia menor propia de errores puntuales de escaneo.
+    - `posible_nombre_comercial`: el nombre observado carece de forma societaria o parece nombre comercial frente a la razón social del padrón.
+    - `discrepancia`: denominación legal distinta.
+    """
     norm_obs = _normalize_company_name(observed_name)
     norm_pad = _normalize_company_name(padron_name)
     if not norm_obs or not norm_pad:
-        return False
+        return "no_evaluable", 0.0
     if norm_obs == norm_pad:
-        return False
-    # Permitir coincidencia por prefijo/subcadena cuando el comprobante abrevia la razón social larga
+        return "coincide_exacto", 1.0
+    # Coincidencia cuando un comprobante abrevia o corta el final de una razón social larga.
     if len(norm_obs) >= 6 and (norm_obs in norm_pad or norm_pad in norm_obs):
-        return False
-    return True
+        ratio = round(min(len(norm_obs), len(norm_pad)) / max(len(norm_obs), len(norm_pad)), 4)
+        return "coincide_exacto", max(ratio, 0.85)
+
+    obs_tokens = set(norm_obs.split())
+    pad_tokens = set(norm_pad.split())
+    jaccard = len(obs_tokens & pad_tokens) / max(len(obs_tokens | pad_tokens), 1)
+    is_natural_person = bool(ruc and str(ruc).strip().startswith("10"))
+    # En personas naturales (RUC 10), SUNAT guarda "APELLIDO1 APELLIDO2 NOMBRES" y los RHE imprimen "NOMBRES APELLIDOS".
+    if is_natural_person and len(obs_tokens) >= 2 and obs_tokens == pad_tokens:
+        return "coincide_exacto", 1.0
+    if (is_natural_person and jaccard >= 0.75 and len(obs_tokens & pad_tokens) >= 2) or (
+        jaccard >= 0.85 and len(obs_tokens & pad_tokens) >= 3
+    ):
+        return "coincide_con_ruido_ocr", round(max(jaccard, 0.85), 4)
+
+    seq_score = SequenceMatcher(None, norm_obs, norm_pad).ratio()
+    combined = round(max(seq_score, (seq_score + jaccard) / 2.0), 4)
+    if seq_score >= 0.84 or (jaccard >= 0.75 and seq_score >= 0.72):
+        return "coincide_con_ruido_ocr", combined
+    # Si el nombre observado carece de forma societaria mientras el padrón sí tiene una (p. ej. "TIENDA LA ECONOMICA" vs "COMERCIAL DEL SUR DEMO S.A."),
+    # suele tratarse de un nombre comercial y no de una suplantación societaria.
+    obs_upper = (observed_name or "").upper()
+    pad_upper = (padron_name or "").upper()
+    if (not _CORP_SUFFIX_RE.search(obs_upper) and _CORP_SUFFIX_RE.search(pad_upper)) or (
+        is_natural_person and len(obs_tokens & pad_tokens) == 0
+    ):
+        return "posible_nombre_comercial", combined
+    return "discrepancia", combined
+
+
+# ¿El nombre leído en el comprobante contradice al del padrón? Sólo da True cuando hay discrepancia real.
+def names_disagree(observed_name: str | None, padron_name: str | None) -> bool:
+    """Devuelve True solo cuando ambos nombres existen y difieren más allá del ruido leve de OCR."""
+    status, _ = compare_names_with_padron(observed_name, padron_name)
+    return status == "discrepancia"
 
 
 # Resultado de buscar un RUC: su estado en el padrón (encontrado, ausente...) y, si lo hay,
@@ -118,7 +198,7 @@ class PadronBatchReport:
         }
 
 
-# DEPRECADO: sólo lo devuelve cargar_padron_staging(), que nadie llama.
+# Resumen que devuelve `cargar_padron_staging()` tras importar el Padrón Reducido de SUNAT hacia SQLite.
 @dataclass(slots=True)
 class PadronStagingResult:
     db_path: str
@@ -188,7 +268,7 @@ class LocalPadronAdapter:
                     "El archivo del padrón no tiene cabecera SQLite válida.",
                 )
             uri = f"file:{self.db_path.resolve().as_posix()}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+            with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=10)) as conn:
                 conn.execute("PRAGMA query_only = ON")
                 tables = {
                     row[0]
@@ -347,7 +427,7 @@ class LocalPadronAdapter:
         # Paso 5: consultar la base por lotes de hasta 900 RUC.
         found_rows: dict[str, tuple[str, str, str, str]] = {}
         uri = f"file:{self.db_path.resolve().as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=15) as conn:
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
             conn.execute("PRAGMA query_only = ON")
             cols = {row[1] for row in conn.execute("PRAGMA table_info(padron)").fetchall()}
             has_ubigeo = "ubigeo" in cols
@@ -412,8 +492,8 @@ class LocalPadronAdapter:
         return report
 
 
-# DEPRECADO: nadie lo llama desde el programa. Cargaba el Padrón Reducido de SUNAT (TXT o ZIP) en una base SQLite.
-# La base del padrón se prepara fuera de este programa.
+# Lo invoca el subcomando «preparar-padron» para convertir el archivo TXT o ZIP oficial del Padrón Reducido
+# de SUNAT en una base SQLite local lista para contrastar razones sociales sin usar internet.
 def cargar_padron_staging(
     source_path: str | Path,
     db_path: str | Path,
@@ -421,11 +501,11 @@ def cargar_padron_staging(
     cutoff_date: str | None = None,
     encoding: str = "cp1252",
 ) -> PadronStagingResult:
-    """Carga un archivo TXT o ZIP del Padrón Reducido SUNAT en SQLite mediante tabla staging.
+    """Importa un archivo TXT o ZIP del Padrón Reducido SUNAT a SQLite pasando por una tabla temporal.
 
-    A diferencia de INSERT OR REPLACE silencioso, contabiliza filas procesadas, RUCs únicos,
-    filas rechazadas por formato/dígito verificador y conflictos cuando un mismo RUC aparece
-    con atributos distintos en el archivo de entrada.
+    A diferencia de un reemplazo silencioso, contabiliza filas procesadas, RUC únicos,
+    filas rechazadas por formato o dígito verificador y conflictos cuando un mismo RUC aparece
+    con atributos distintos dentro del mismo archivo de entrada.
     """
     src = Path(source_path)
     dst = Path(db_path)
@@ -454,7 +534,7 @@ def cargar_padron_staging(
     conflicts: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
 
-    with sqlite3.connect(dst, timeout=30) as conn:
+    with contextlib.closing(sqlite3.connect(dst, timeout=30)) as conn:
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(
             """

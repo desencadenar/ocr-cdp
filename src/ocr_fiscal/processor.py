@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
+import os
 from pathlib import Path
+import re
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .amount_panel import review_amount_panel
 from .archives import ContainerWalker, WorkUnit
 from .config import AppConfig
-from .documents import read_work_unit
+from .documents import read_work_unit, reocr_line_bbox
 from .extraction import parse_document
 from .models import (
     AMBIGUOUS,
@@ -22,11 +25,14 @@ from .models import (
     READ_ERROR,
     ArchiveSummary,
     ExtractionResult,
+    FieldEvidence,
     StageEvent,
 )
 from .ocr import OCREngine, TesseractOCREngine
-from .padron import LocalPadronAdapter, names_disagree
+from .padron import LocalPadronAdapter, compare_names_with_padron
+from .pdf_organizer import organize_pdf_expediente
 from .storage import StateStore
+from .tax import normalize_correlativo, validate_ruc
 # Un aviso de avance para la ventana: en qué unidad va, cuántas hay en total y los contadores acumulados.
 @dataclass
 class ProgressUpdate:
@@ -248,6 +254,172 @@ class ScanSummary:
         }
 
 
+_QR_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})$")
+
+
+def _parse_sunat_qr_payload(raw_qr: str) -> dict[str, str] | None:
+    """Interpreta la cadena estándar SUNAT delimitada por `|` del código QR."""
+    parts = [p.strip() for p in (raw_qr or "").split("|")]
+    if len(parts) < 7:
+        return None
+    emitter_ruc = parts[0]
+    if not (len(emitter_ruc) == 11 and emitter_ruc.isdigit()):
+        return None
+    doc_type = parts[1].zfill(2) if parts[1].isdigit() else parts[1]
+    series = parts[2].upper()
+    correlativo_res = normalize_correlativo(parts[3])
+    igv = parts[4]
+    total = parts[5]
+    raw_date = parts[6]
+    iso_date: str | None = None
+    if _QR_DATE_RE.match(raw_date):
+        if "-" in raw_date:
+            iso_date = raw_date
+        else:
+            d, m, y = raw_date.split("/")
+            iso_date = f"{y}-{m}-{d}"
+    recipient_doc = parts[8] if len(parts) > 8 and parts[8].isdigit() else None
+    return {
+        "emitter_ruc": emitter_ruc,
+        "document_type": doc_type,
+        "series": series,
+        "correlativo_normalized": correlativo_res.normalized or parts[3],
+        "igv": igv,
+        "total": total,
+        "issue_date": iso_date or raw_date,
+        "recipient_ruc": recipient_doc or "",
+    }
+
+
+def _crosscheck_sunat_qr(result: ExtractionResult, pages: Sequence[Any]) -> None:
+    """Coteja lo extraído visualmente contra el código QR SUNAT de las páginas del comprobante (si existe)."""
+    if not result.comprobante_detectado:
+        return
+    qr_entries: list[dict[str, str]] = []
+    for p in pages:
+        pno = getattr(p, "page_number", 1)
+        if not (result.page_start <= pno <= result.page_end):
+            continue
+        for payload in getattr(p, "qr_payloads", ()) or ():
+            parsed = _parse_sunat_qr_payload(payload)
+            if parsed:
+                qr_entries.append(parsed)
+
+    if not qr_entries:
+        result.derived_checks.append(
+            {"check": "sunat_qr_crosscheck", "status": "sin_qr", "consistent": None}
+        )
+        return
+
+    # Si hay más de un QR en el rango de páginas, priorizamos el que coincida en serie o RUC emisor.
+    qr = next(
+        (
+            entry for entry in qr_entries
+            if (result.series and entry["series"] == result.series.upper())
+            or (result.emitter_ruc and entry["emitter_ruc"] == result.emitter_ruc)
+        ),
+        qr_entries[0],
+    )
+    discrepancies: list[str] = []
+
+    if result.emitter_ruc and qr["emitter_ruc"] != result.emitter_ruc:
+        discrepancies.append(f"ruc_emisor(texto={result.emitter_ruc} vs qr={qr['emitter_ruc']})")
+    if result.document_type and qr["document_type"] != result.document_type:
+        discrepancies.append(f"tipo(texto={result.document_type} vs qr={qr['document_type']})")
+    if result.series and qr["series"] != result.series.upper():
+        discrepancies.append(f"serie(texto={result.series} vs qr={qr['series']})")
+    if result.correlativo_normalized and qr["correlativo_normalized"] != result.correlativo_normalized:
+        discrepancies.append(f"correlativo(texto={result.correlativo_normalized} vs qr={qr['correlativo_normalized']})")
+    if result.issue_date and qr["issue_date"] and qr["issue_date"] != result.issue_date:
+        discrepancies.append(f"fecha(texto={result.issue_date} vs qr={qr['issue_date']})")
+    if result.igv and qr["igv"]:
+        try:
+            if abs(Decimal(result.igv) - Decimal(qr["igv"].replace(",", ""))) > Decimal("0.02"):
+                discrepancies.append(f"igv(texto={result.igv} vs qr={qr['igv']})")
+        except InvalidOperation:
+            pass
+    if result.total and qr["total"]:
+        try:
+            if abs(Decimal(result.total) - Decimal(qr["total"].replace(",", ""))) > Decimal("0.02"):
+                discrepancies.append(f"total(texto={result.total} vs qr={qr['total']})")
+        except InvalidOperation:
+            pass
+    if result.recipient_ruc and qr["recipient_ruc"] and len(qr["recipient_ruc"]) == 11 and qr["recipient_ruc"] != result.recipient_ruc:
+        discrepancies.append(f"ruc_receptor(texto={result.recipient_ruc} vs qr={qr['recipient_ruc']})")
+
+    status = "difiere" if discrepancies else "coincide"
+    result.derived_checks.append(
+        {
+            "check": "sunat_qr_crosscheck",
+            "status": status,
+            "consistent": not discrepancies,
+            "discrepancies": discrepancies,
+            "qr_summary": f"{qr['emitter_ruc']}-{qr['document_type']}-{qr['series']}-{qr['correlativo_normalized']} (IGV={qr['igv']}, Total={qr['total']})",
+        }
+    )
+    if discrepancies:
+        result.observations.append(f"cotejo QR SUNAT difiere: {', '.join(discrepancies)}")
+        if "qr_crosscheck" not in result.secondary_review_fields:
+            result.secondary_review_fields.append("qr_crosscheck")
+
+
+def _surgical_line_reocr(
+    unit: WorkUnit,
+    pages: Sequence[Any],
+    results: Sequence[ExtractionResult],
+    config: AppConfig,
+    engine: OCREngine,
+) -> list[StageEvent]:
+    """Relee con `--psm 7` solo las líneas puntuales que tuvieron error de dígito verificador o duda O/0."""
+    events: list[StageEvent] = []
+    if not isinstance(engine, TesseractOCREngine):
+        return events
+    page_map = {getattr(p, "page_number", 1): p for p in pages}
+
+    for res in results:
+        if not res.comprobante_detectado:
+            continue
+        targets: list[tuple[str, Any]] = []
+        # Caso 1: RUC emisor sin validar o serie marcada para revisión secundaria.
+        for fname in ("emitter_ruc", "series", "correlativo", "total"):
+            if fname in res.secondary_review_fields or (fname == "emitter_ruc" and not res.emitter_ruc):
+                ev_list = res.field_evidence.get(fname) or []
+                for ev in ev_list:
+                    if ev.source == "ocr" and ev.bbox is not None:
+                        targets.append((fname, ev))
+                        break
+        for fname, ev in targets[:3]:
+            page = page_map.get(ev.page_number)
+            rot_angle = int((getattr(page, "quality", {}) or {}).get("rotation_angle", 0)) if page else 0
+            reread = reocr_line_bbox(unit, ev.page_number, ev.bbox, config, engine, rotation_angle=rot_angle)
+            if not reread:
+                continue
+            events.append(
+                StageEvent(
+                    "alternate_region_ocr",
+                    "succeeded",
+                    f"relectura de línea ({fname}): {reread[:80]}",
+                    ev.page_number,
+                )
+            )
+            if fname == "emitter_ruc" and not res.emitter_ruc:
+                for tok in re.findall(r"(?<![0-9])[0-9]{11}(?![0-9])", reread):
+                    val = validate_ruc(tok)
+                    if val.format_valid and val.checksum_valid:
+                        res.observations.append(
+                            f"relectura de línea {fname} sugiere RUC válido {tok} (texto original: {ev.observed_value})"
+                        )
+                        res.candidates.setdefault("emitter_ruc", [])
+                        if tok not in res.candidates["emitter_ruc"]:
+                            res.candidates["emitter_ruc"].append(tok)
+                        break
+            elif reread.strip() != ev.excerpt.strip():
+                res.observations.append(
+                    f"relectura puntual de {fname}: «{reread}»"
+                )
+    return events
+
+
 # El orquestador: junta todas las piezas (recorrer carpetas, leer, extraer, guardar y reconciliar).
 # Una corrida corresponde a una carpeta de salida nueva.
 class FiscalProcessor:
@@ -293,6 +465,7 @@ class FiscalProcessor:
             "umbral_confianza_ocr": round(self.config.min_ocr_confidence * 100),
             "segundos_por_pagina": self.config.timeout_seconds,
             "releer_recuadro_importes": self.config.read_amount_panel,
+            "exportar_pdf_ordenado": self.config.export_pdf_folders,
             "padron_ruc": str(self.config.padron_db_path) if self.config.padron_db_path else None,
         }
         if summary is not None:
@@ -467,9 +640,12 @@ class FiscalProcessor:
             "reason": padron_report.reason,
         }
 
-        # El padrón se usa para contrastar el nombre asociado al RUC observado.
+        # El padrón local se usa para validar existencia del RUC en la instantánea y cotejar razones sociales.
         for item in summary.outcomes:
             em_ruc = str(item.fields.get("emitter_ruc") or item.fields_original.get("emitter_ruc") or "").strip()
+            obs_em_name = item.fields.get("issuer_name") or item.fields_original.get("issuer_name")
+            em_match_status = "no_evaluable"
+            em_similarity = 0.0
             if em_ruc and em_ruc in padron_report.entries:
                 em_entry = padron_report.entries[em_ruc]
                 item.emitter_padron_status = em_entry.status
@@ -478,22 +654,69 @@ class FiscalProcessor:
                 item.emitter_padron_cond_domicilio = em_entry.cond_domicilio
                 item.emitter_padron_cutoff_date = em_entry.cutoff_date
                 item.emitter_padron_source = em_entry.source_path
-                obs_name = item.fields.get("issuer_name") or item.fields_original.get("issuer_name")
-                if names_disagree(obs_name, em_entry.razon_social):
+                if em_entry.status == "ausente" and item.detection_status == DETECTED:
+                    if "emitter_ruc_padron" not in item.secondary_review_fields:
+                        item.secondary_review_fields.append("emitter_ruc_padron")
+                    item.requires_human_review = True
+                    item.observations.append(f"ruc_emisor_ausente_en_padron: {em_ruc} no figura en la instantánea local")
+                em_match_status, em_similarity = compare_names_with_padron(obs_em_name, em_entry.razon_social, ruc=em_ruc)
+                if em_match_status == "discrepancia":
                     item.emitter_name_discrepancy = True
                     if "issuer_name" not in item.secondary_review_fields:
                         item.secondary_review_fields.append("issuer_name")
                     item.observations.append(
-                        f"discrepancia_razon_social_padron: observada={obs_name!r} vs padron={em_entry.razon_social!r}"
+                        f"discrepancia_razon_social_emisor: observada={obs_em_name!r} vs padron={em_entry.razon_social!r}"
+                    )
+                elif em_match_status == "posible_nombre_comercial":
+                    item.observations.append(
+                        f"posible_nombre_comercial_emisor: observado={obs_em_name!r} vs razon_social_padron={em_entry.razon_social!r}"
                     )
 
+            if self.config.recipient_ruc and em_ruc == self.config.recipient_ruc and item.detection_status == DETECTED:
+                if "emitter_ruc_self" not in item.secondary_review_fields:
+                    item.secondary_review_fields.append("emitter_ruc_self")
+                item.requires_human_review = True
+                item.observations.append(
+                    f"posible_comprobante_de_venta_propia: el RUC emisor ({em_ruc}) coincide con el RUC receptor objetivo"
+                )
+
             rec_ruc = str(item.fields.get("recipient_ruc") or item.fields_original.get("recipient_ruc") or "").strip()
+            obs_rec_name = item.fields.get("recipient_name") or item.fields_original.get("recipient_name")
+            rec_match_status = "no_evaluable"
+            rec_similarity = 0.0
             if rec_ruc and rec_ruc in padron_report.entries:
                 rec_entry = padron_report.entries[rec_ruc]
                 item.recipient_padron_status = rec_entry.status
                 item.recipient_padron_razon_social = rec_entry.razon_social
                 item.recipient_padron_estado = rec_entry.estado
                 item.recipient_padron_cond_domicilio = rec_entry.cond_domicilio
+                if rec_entry.status == "ausente" and item.detection_status == DETECTED:
+                    if "recipient_ruc_padron" not in item.secondary_review_fields:
+                        item.secondary_review_fields.append("recipient_ruc_padron")
+                    item.requires_human_review = True
+                    item.observations.append(f"ruc_receptor_ausente_en_padron: {rec_ruc} no figura en la instantánea local")
+                rec_match_status, rec_similarity = compare_names_with_padron(obs_rec_name, rec_entry.razon_social, ruc=rec_ruc)
+                if rec_match_status == "discrepancia":
+                    if "recipient_name" not in item.secondary_review_fields:
+                        item.secondary_review_fields.append("recipient_name")
+                    item.observations.append(
+                        f"discrepancia_razon_social_receptor: observada={obs_rec_name!r} vs padron={rec_entry.razon_social!r}"
+                    )
+
+            if item.detection_status == DETECTED and (em_match_status != "no_evaluable" or rec_match_status != "no_evaluable"):
+                item.derived_checks = [
+                    chk for chk in item.derived_checks if chk.get("check") != "padron_name_crosscheck"
+                ]
+                item.derived_checks.append(
+                    {
+                        "check": "padron_name_crosscheck",
+                        "consistent": em_match_status != "discrepancia" and rec_match_status != "discrepancia",
+                        "emitter_status": em_match_status,
+                        "emitter_similarity": em_similarity,
+                        "recipient_status": rec_match_status,
+                        "recipient_similarity": rec_similarity,
+                    }
+                )
 
             # Verificación oficial: este programa no consulta a SUNAT, por eso todo comprobante detectado queda «pendiente».
             if item.detection_status == DETECTED:
@@ -502,7 +725,7 @@ class FiscalProcessor:
             else:
                 item.official_validation_status = "no_aplica"
 
-        # Paso 7: Agrupar y conciliar por clave fiscal confirmada (RUC emisor + tipo + serie + correlativo)
+        # Paso 7: agrupamos y conciliamos por clave fiscal completa (RUC emisor, tipo, serie y correlativo).
         groups_by_key: dict[str, list[DocumentOutcome]] = {}
         for item in summary.outcomes:
             if (
@@ -536,7 +759,7 @@ class FiscalProcessor:
             }
             is_adjustment = bool(doc_types & {"07", "08"})
 
-            # Verificar concordancia de moneda, fecha, total, receptor, referencia
+            # Comprobamos que moneda, fecha, adquirente, referencia y totales coincidan entre copias.
             conflicts: list[str] = []
             currencies = {str(it.fields.get("currency")).strip() for it in group if it.fields.get("currency")}
             if len(currencies) > 1:
@@ -556,15 +779,22 @@ class FiscalProcessor:
                 conflicts.append(f"documento_referencia({sorted(refs)})")
 
             totals_dec: list[Decimal] = []
+            igvs_dec: list[Decimal] = []
+            gravs_dec: list[Decimal] = []
             for it in group:
-                raw_tot = it.fields.get("total")
-                if raw_tot:
-                    try:
-                        totals_dec.append(Decimal(str(raw_tot).replace(",", "")))
-                    except InvalidOperation:
-                        pass
+                for fname_chk, target_list in (("total", totals_dec), ("igv", igvs_dec), ("gravado", gravs_dec)):
+                    raw_val = it.fields.get(fname_chk)
+                    if raw_val:
+                        try:
+                            target_list.append(Decimal(str(raw_val).replace(",", "")))
+                        except InvalidOperation:
+                            pass
             if len(totals_dec) > 1 and (max(totals_dec) - min(totals_dec)) > Decimal("0.02"):
                 conflicts.append(f"total({sorted(str(d) for d in set(totals_dec))})")
+            if len(igvs_dec) > 1 and (max(igvs_dec) - min(igvs_dec)) > Decimal("0.02"):
+                conflicts.append(f"igv({sorted(str(d) for d in set(igvs_dec))})")
+            if len(gravs_dec) > 1 and (max(gravs_dec) - min(gravs_dec)) > Decimal("0.02"):
+                conflicts.append(f"base_gravada({sorted(str(d) for d in set(gravs_dec))})")
 
             # Si las copias discrepan, ninguna se da por buena: todas quedan en revisión.
             if conflicts:
@@ -589,24 +819,43 @@ class FiscalProcessor:
             if not is_adjustment:
                 reconciled_cdp_keys += 1
 
-            # Criterio para elegir la copia principal: se prefiere la que venga sola en su página, sin error de lectura,
-            # desde el disco (no desde un ZIP), con texto nativo y con más campos secundarios leídos.
-            # El resto del orden sólo sirve para desempatar siempre de la misma manera.
+            # Contamos cuántos comprobantes detectados trae cada archivo fuente: una factura con sus propios anexos
+            # (un comprobante más guías o constancias) no debe quedar en desventaja frente a una copia suelta en ZIP.
+            cdp_count_by_source: dict[int | None, int] = {}
+            for out_it in summary.outcomes:
+                if out_it.detection_status == DETECTED:
+                    cdp_count_by_source[out_it.source_id] = cdp_count_by_source.get(out_it.source_id, 0) + 1
+
+            # Criterio para elegir la copia principal: se prefiere la que venga como único CDP de su archivo,
+            # sin error de lectura, con texto digital nativo (aunque venga en ZIP) sobre escaneos,
+            # con cuadre aritmético y QR coincidente, con menos campos en revisión, y en disco antes que en ZIP.
             def _primary_sort_key(it: DocumentOutcome) -> tuple[Any, ...]:
-                single_unit = 1 if unit_group_counts.get(it.document_id, 1) == 1 else 0
+                single_cdp_unit = 1 if cdp_count_by_source.get(it.source_id, 1) == 1 else 0
                 no_err = 1 if not it.read_error else 0
-                on_disk = 1 if (it.nested_depth == 0 and it.member_path is None) else 0
                 is_native = 1 if it.reading_source == "native_pdf_text" else 0
+                arith_ok = 1 if any(
+                    chk.get("check") == "arithmetic_total_reconciliation" and chk.get("consistent")
+                    for chk in it.derived_checks
+                ) else 0
+                qr_ok = 1 if any(
+                    chk.get("check") == "sunat_qr_crosscheck" and chk.get("status") == "coincide"
+                    for chk in it.derived_checks
+                ) else 0
+                few_reviews = len(it.secondary_review_fields)
+                on_disk = 1 if (it.nested_depth == 0 and it.member_path is None) else 0
                 sec_fields = sum(
                     1
                     for k in ("issue_date", "recipient_ruc", "currency", "igv", "total", "issuer_name")
                     if it.fields.get(k) or it.fields_original.get(k)
                 )
                 return (
-                    -single_unit,
+                    -single_cdp_unit,
                     -no_err,
-                    -on_disk,
                     -is_native,
+                    -arith_ok,
+                    -qr_ok,
+                    few_reviews,
+                    -on_disk,
                     -sec_fields,
                     it.source_id or 0,
                     it.page_start,
@@ -691,6 +940,7 @@ class FiscalProcessor:
                     "requires_human_review": item.requires_human_review,
                     "observations": item.observations,
                     "secondary_review_fields": item.secondary_review_fields,
+                    "derived_checks": item.derived_checks,
                 },
             )
 
@@ -724,6 +974,69 @@ class FiscalProcessor:
             observations=["no fue posible leer el archivo"],
             read_error_details=[msg],
         )
+
+    def _process_single_unit(
+        self,
+        unit: WorkUnit,
+        target_ruc: str | None,
+    ) -> tuple[list[ExtractionResult], list[StageEvent], str, int, float, float, float, dict[int, int]]:
+        """Lee, extrae, ejecuta cotejos locales (QR y relectura de línea) para una unidad."""
+        unit_started = time.perf_counter()
+        read_t0 = time.perf_counter()
+        try:
+            read_result = read_work_unit(unit, self.engine, self.config)
+            read_ms = (time.perf_counter() - read_t0) * 1000.0
+            rotations = {
+                getattr(p, "page_number", 1): int((getattr(p, "quality", {}) or {}).get("rotation_angle", 0))
+                for p in read_result.pages
+                if int((getattr(p, "quality", {}) or {}).get("rotation_angle", 0)) in {90, 180, 270}
+            }
+
+            ext_t0 = time.perf_counter()
+            results = parse_document(
+                read_result.pages,
+                self.config.document_types,
+                self.config.min_ocr_confidence,
+                target_recipient_ruc=target_ruc,
+                rounding_tolerance=self.config.rounding_tolerance,
+            )
+            events = list(read_result.events)
+
+            if (
+                self.config.read_amount_panel and read_result.source_format == "pdf"
+                and len(results) == 1
+                and results[0].comprobante_detectado and results[0].document_type in {"01", "03", "07", "08"}
+            ):
+                total_ev = results[0].field_evidence.get("total") or []
+                target_page_no = total_ev[0].page_number if total_ev else results[0].page_end
+                page_map = {p.page_number: p for p in read_result.pages}
+                target_page = page_map.get(target_page_no) or (read_result.pages[-1] if read_result.pages else None)
+                if target_page is not None:
+                    panel_event = review_amount_panel(unit, target_page, results[0], self.config, self.engine)
+                    if panel_event is not None:
+                        events.append(panel_event)
+
+            events.extend(_surgical_line_reocr(unit, read_result.pages, results, self.config, self.engine))
+            for item_res in results:
+                _crosscheck_sunat_qr(item_res, read_result.pages)
+
+            ext_ms = (time.perf_counter() - ext_t0) * 1000.0
+            return results, events, read_result.source_format, read_result.page_count, read_ms, ext_ms, (time.perf_counter() - unit_started), rotations
+        except Exception as exc:
+            read_ms = (time.perf_counter() - read_t0) * 1000.0
+            result = self._read_failure(exc)
+            events = [
+                StageEvent(
+                    "document_read",
+                    "failed",
+                    f"{type(exc).__name__}: {exc}",
+                    1,
+                    source_id=unit.source_ref.source_id,
+                    member_path=unit.source_ref.member_path,
+                    container_chain=unit.source_ref.container_chain,
+                )
+            ]
+            return [result], events, unit.source_ref.detected_format, 0, read_ms, 0.0, (time.perf_counter() - unit_started), {}
 
     # La corrida completa: recorre la entrada, lee cada documento, extrae sus datos, los guarda y, al final, los reconcilia.
     # Se puede cancelar y va avisando de su avance.
@@ -784,100 +1097,21 @@ class FiscalProcessor:
         }
         processed_unit_indices: set[int] = set()
         unit_group_counts: dict[int, int] = {}
+        units_by_source_id: dict[int, WorkUnit] = {}
+        source_formats_by_doc: dict[int, str] = {}
+        rotations_by_source_id: dict[int, dict[int, int]] = {}
         target_ruc = self.config.recipient_ruc
 
-        # Paso 5: procesar cada unidad (cada documento), una por una.
-        for idx, unit in enumerate(walk_result.work_units, start=1):
-            # Si el usuario pidió cancelar, se anota y se sale del bucle.
-            if cancel_event is not None and cancel_event.is_set():
-                summary.cancelled = True
-                summary.run_status = "cancelado"
-                self.store.add_events(
-                    None,
-                    [
-                        StageEvent(
-                            "scan_cancelled",
-                            "cancelled",
-                            f"Cancelado por el usuario tras procesar {summary.processed_file_count}/{total_units} unidades",
-                        )
-                    ],
-                )
-                break
-
-            # Se avisa de qué se va a procesar, para la barra de avance.
-            if progress_callback is not None:
-                progress_callback(
-                    ProgressUpdate(
-                        stage="procesando",
-                        current_unit=idx,
-                        total_units=total_units,
-                        current_path=unit.display_path,
-                        detected_count=summary.detected_count,
-                        ambiguous_count=summary.ambiguous_count,
-                        no_comprobante_count=summary.no_comprobante_count,
-                        read_error_count=summary.read_error_count,
-                        zip_container_count=summary.zip_container_count,
-                        message=f"Leyendo {Path(unit.source_ref.source_path).name}",
-                    )
-                )
-
-            summary.started_unit_count += 1
-            unit_started = time.perf_counter()
-            read_t0 = time.perf_counter()
-            try:
-                # 5a. Leer el documento (texto nativo u OCR).
-                read_result = read_work_unit(unit, self.engine, self.config)
-                stage_timings_ms["document_read_and_ocr"] += (time.perf_counter() - read_t0) * 1000.0
-
-                ext_t0 = time.perf_counter()
-                # 5b. Extraer los datos: tipo, RUC, fecha, importes... Un mismo documento puede dar varios resultados
-                # (por ejemplo, varios comprobantes en una página).
-                results = parse_document(
-                    read_result.pages,
-                    self.config.document_types,
-                    self.config.min_ocr_confidence,
-                    target_recipient_ruc=target_ruc,
-                )
-                stage_timings_ms["extraction_and_triage"] += (time.perf_counter() - ext_t0) * 1000.0
-
-                events = list(read_result.events)
-                # El cuadro se relee solo si el perfil lo pide y la página contiene
-                # una sola factura. Así se mantiene cada importe en su comprobante.
-                if (
-                    self.config.read_amount_panel and read_result.source_format == "pdf"
-                    and len(read_result.pages) == len(results) == 1
-                    and results[0].comprobante_detectado and results[0].document_type == "01"
-                ):
-                    panel_event = review_amount_panel(unit, read_result.pages[0], results[0], self.config, self.engine)
-                    if panel_event is not None:
-                        events.append(panel_event)
-                source_format = read_result.source_format
-                page_count = read_result.page_count
-            # Si algo falla al leer o al extraer, ese documento queda como error de lectura y la corrida sigue con el siguiente.
-            except Exception as exc:
-                stage_timings_ms["document_read_and_ocr"] += (time.perf_counter() - read_t0) * 1000.0
-                result = self._read_failure(exc)
-                events = [
-                    StageEvent(
-                        "document_read",
-                        "failed",
-                        f"{type(exc).__name__}: {exc}",
-                        1,
-                        source_id=unit.source_ref.source_id,
-                        member_path=unit.source_ref.member_path,
-                        container_chain=unit.source_ref.container_chain,
-                    )
-                ]
-                results = [result]
-                source_format = unit.source_ref.detected_format
-                page_count = 0
-
-            # 5c. Guardar los eventos y cada resultado en la base, y atribuir lo hallado al ZIP que contenía el documento.
-            elapsed = time.perf_counter() - unit_started
+        def _persist_unit_output(idx: int, unit: WorkUnit, payload: tuple[list[ExtractionResult], list[StageEvent], str, int, float, float, float, dict[int, int]]) -> None:
+            results, events, source_format, page_count, read_ms, ext_ms, elapsed, rotations = payload
+            stage_timings_ms["document_read_and_ocr"] += read_ms
+            stage_timings_ms["extraction_and_triage"] += ext_ms
             per_result_elapsed = elapsed / max(1, len(results))
             store_t0 = time.perf_counter()
             ref = unit.source_ref
-            # Dos bloques pueden compartir una página, pero solo hubo una lectura física.
+            units_by_source_id[ref.source_id] = unit
+            if rotations:
+                rotations_by_source_id[ref.source_id] = rotations
             self.store.add_events(None, [
                 replace(event, source_id=ref.source_id, member_path=ref.member_path,
                         container_chain=ref.container_chain)
@@ -886,9 +1120,9 @@ class FiscalProcessor:
             for result in results:
                 outcome = self._store_result(unit, result, page_count, source_format, per_result_elapsed)
                 unit_group_counts[outcome.document_id] = len(results)
+                source_formats_by_doc[outcome.document_id] = source_format
                 summary.outcomes.append(outcome)
 
-                # Atribuir resultado al contenedor ZIP directo y a los contenedores padre si es anidado
                 if unit.source_ref.container_chain:
                     for chain_len in range(1, len(unit.source_ref.container_chain) + 1):
                         sub_chain = tuple(unit.source_ref.container_chain[:chain_len])
@@ -903,7 +1137,6 @@ class FiscalProcessor:
                             elif outcome.detection_status == NOT_RECEIPT:
                                 arch.non_receipts += 1
 
-            # 5d. Anotar la unidad como procesada y sumarla a cada ZIP que la contiene.
             summary.processed_file_count += 1
             processed_unit_indices.add(idx - 1)
             if unit.source_ref.container_chain:
@@ -913,6 +1146,95 @@ class FiscalProcessor:
                     if arch is not None:
                         arch.processed_members += 1
             stage_timings_ms["storage"] += (time.perf_counter() - store_t0) * 1000.0
+
+            if progress_callback is not None:
+                progress_callback(
+                    ProgressUpdate(
+                        stage="procesando",
+                        current_unit=summary.processed_file_count,
+                        total_units=total_units,
+                        current_path=unit.display_path,
+                        detected_count=summary.detected_count,
+                        ambiguous_count=summary.ambiguous_count,
+                        no_comprobante_count=summary.no_comprobante_count,
+                        read_error_count=summary.read_error_count,
+                        zip_container_count=summary.zip_container_count,
+                        message=f"Procesado {Path(unit.source_ref.source_path).name}",
+                    )
+                )
+
+        # Paso 5: lectura y extracción (en paralelo en CPU cuando hay múltiples unidades; guardado en orden determinista).
+        max_workers = min(max(1, (os.cpu_count() or 2) - 1), 4)
+        work_units = walk_result.work_units
+        if max_workers <= 1 or len(work_units) <= 1:
+            for idx, unit in enumerate(work_units, start=1):
+                if cancel_event is not None and cancel_event.is_set():
+                    summary.cancelled = True
+                    summary.run_status = "cancelado"
+                    self.store.add_events(
+                        None,
+                        [
+                            StageEvent(
+                                "scan_cancelled",
+                                "cancelled",
+                                f"Cancelado por el usuario tras procesar {summary.processed_file_count}/{total_units} unidades",
+                            )
+                        ],
+                    )
+                    break
+                summary.started_unit_count += 1
+                _persist_unit_output(idx, unit, self._process_single_unit(unit, target_ruc))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                in_flight: dict[Any, tuple[int, WorkUnit]] = {}
+                completed_buffer: dict[int, tuple[WorkUnit, tuple[list[ExtractionResult], list[StageEvent], str, int, float, float, float]]] = {}
+                next_submit = 0
+                next_commit = 1
+
+                while next_submit < len(work_units) and len(in_flight) < max_workers * 2:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    summary.started_unit_count += 1
+                    u_cur = work_units[next_submit]
+                    fut = pool.submit(self._process_single_unit, u_cur, target_ruc)
+                    in_flight[fut] = (next_submit + 1, u_cur)
+                    next_submit += 1
+
+                while in_flight:
+                    if cancel_event is not None and cancel_event.is_set():
+                        summary.cancelled = True
+                        summary.run_status = "cancelado"
+                        self.store.add_events(
+                            None,
+                            [
+                                StageEvent(
+                                    "scan_cancelled",
+                                    "cancelled",
+                                    f"Cancelado por el usuario tras procesar {summary.processed_file_count}/{total_units} unidades",
+                                )
+                            ],
+                        )
+                        for fut in list(in_flight):
+                            fut.cancel()
+                        break
+
+                    done, _ = wait(in_flight.keys(), timeout=0.25, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        idx_done, u_done = in_flight.pop(fut)
+                        completed_buffer[idx_done] = (u_done, fut.result())
+                        while next_submit < len(work_units) and len(in_flight) < max_workers * 2:
+                            if cancel_event is not None and cancel_event.is_set():
+                                break
+                            summary.started_unit_count += 1
+                            u_next = work_units[next_submit]
+                            new_fut = pool.submit(self._process_single_unit, u_next, target_ruc)
+                            in_flight[new_fut] = (next_submit + 1, u_next)
+                            next_submit += 1
+
+                    while next_commit in completed_buffer:
+                        u_commit, payload_commit = completed_buffer.pop(next_commit)
+                        _persist_unit_output(next_commit, u_commit, payload_commit)
+                        next_commit += 1
 
         # Registrar unidades pendientes y distinguir contenedor inspeccionado vs miembros procesados
         unprocessed_units = [
@@ -940,10 +1262,48 @@ class FiscalProcessor:
             if summary.cancelled and arch.unprocessed_members_count > 0:
                 arch.cancelled = True
 
-        # Paso 6: reconciliar (padrón y copias del mismo comprobante), guardar el resumen de los ZIP
-        # y los datos finales de la corrida.
+        # Paso 6: reconciliar (padrón y copias del mismo comprobante), organizar PDFs por proveedor (si está activado),
+        # guardar el resumen de los ZIP y los datos finales de la corrida.
         reconcile_t0 = time.perf_counter()
         self._reconcile_outcomes(summary, unit_group_counts)
+        if self.config.export_pdf_folders:
+            pdf_stats = organize_pdf_expediente(
+                self.output_root,
+                summary.outcomes,
+                units_by_source_id,
+                source_formats_by_doc,
+                rotations_by_source_id,
+                unit_group_counts,
+                max_provider_name_len=self.config.max_provider_folder_name_len,
+                unify_notes_by_provider=self.config.unify_notes_by_provider,
+                target_recipient_ruc=self.config.recipient_ruc,
+            )
+            for item in summary.outcomes:
+                self.store.update_document_post_processing(
+                    item.document_id,
+                    {
+                        "normalized_filename": item.normalized_filename,
+                        "organized_path": item.output_path,
+                        "observations": item.observations,
+                        "requires_human_review": item.requires_human_review,
+                        "derived_checks": item.derived_checks,
+                        "secondary_review_fields": item.secondary_review_fields,
+                    },
+                )
+            summary.reconciliation_summary["organized_primary_copies_count"] = (
+                pdf_stats["cdp_complete"] + pdf_stats["notes_complete"]
+            )
+            summary.reconciliation_summary["pdf_export_summary"] = pdf_stats
+            self.store.add_events(
+                None,
+                [
+                    StageEvent(
+                        "pdf_expediente_export",
+                        "succeeded",
+                        f"Exportados {pdf_stats['total_exported']} PDFs (cdp={pdf_stats['cdp_complete']}, notas={pdf_stats['notes_complete']}, revision={pdf_stats['pending_review']})",
+                    )
+                ],
+            )
         stage_timings_ms["reconciliation_and_validation"] = (time.perf_counter() - reconcile_t0) * 1000.0
 
         self.store.store_archive_summaries(walk_result.archive_summaries)

@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from PIL import Image, ImageDraw, ImageOps
 import pymupdf
 
-from .amounts import SETTLEMENT_FIELDS, amount_mentions, reconcile_amounts
+from .amounts import SETTLEMENT_FIELDS, amount_mentions, pair_columnar_amounts, reconcile_amounts
 from .archives import WorkUnit
 from .config import AppConfig
 from .documents import PageRead
@@ -19,11 +19,17 @@ from .ocr import OCREngine, OCRExecutionError, OCRUnavailable, TesseractOCREngin
 
 
 # Rótulos que marcan dónde empieza y dónde acaba el cuadro de importes:
-# «Sub total ventas» arriba e «Importe total» abajo.
-_SUBTOTAL = re.compile(r"^\s*SUB\s*TOTAL\s+VENTAS?\b", re.IGNORECASE)
-_TOTAL = re.compile(r"^\s*IMPORTE\s+TOTAL\b", re.IGNORECASE)
-# Importes que el cuadro tiene que traer por sí mismo para que se acepte la segunda lectura.
-_REQUIRED_FIELDS = {"subtotal", "valor_venta", "descuentos", "igv", "total"}
+# «Sub total ventas», «Valor de venta» u «Op. Gravadas» arriba, e «Importe total» o «Total» abajo.
+_SUBTOTAL = re.compile(
+    r"^\s*(?:SUB\s*TOTAL(?:\s+(?:VENTAS?|BRUTO|NETO))?|(?:TOTAL\s+)?VALOR\s+(?:DE\s+)?VENTA|(?:TOTAL\s+)?(?:OP\.?|OPERACIONES)\s+GRAVAD[AO]S?)\b",
+    re.IGNORECASE,
+)
+_TOTAL = re.compile(
+    r"^\s*(?:IMPORTE\s+TOTAL|TOTAL\s+VENTA|MONTO\s+TOTAL|TOTAL\s+GENERAL|TOTAL\s+A\s+PAGAR|TOTAL)\b",
+    re.IGNORECASE,
+)
+# Campos base cuya presencia (al menos uno) se exige junto con IGV y Total para aceptar el recuadro.
+_PANEL_BASE_FIELDS = ("subtotal", "valor_venta", "gravado", "inafecto", "exonerado")
 # Resolución a la que se recorta y se vuelve a leer el cuadro (más alta que la de la página entera).
 _PANEL_DPI = 300
 # Margen blanco, en píxeles, que se añade alrededor del recorte para que el OCR no lea mal los bordes.
@@ -31,17 +37,22 @@ _BORDER = 12
 
 
 # Busca en el OCR de la página dónde empieza y dónde acaba el cuadro de importes y devuelve ese rectángulo.
-# Si no hay exactamente un inicio y un final, o su forma no tiene sentido, devuelve None.
+# Si no hay un inicio y un final claros, o su forma no tiene sentido, devuelve None.
 def _panel_box(layout: list[LayoutLine]) -> pymupdf.Rect | None:
-    # Paso 1: localizar la línea que abre el cuadro y la que lo cierra. Tiene que haber exactamente una de cada.
+    # Paso 1: localizar la línea que abre el cuadro y la que lo cierra.
     starts = [line.bbox for line in layout if line.bbox and line.source == "tesseract" and _SUBTOTAL.search(line.text)]
     ends = [line.bbox for line in layout if line.bbox and line.source == "tesseract" and _TOTAL.search(line.text)]
-    if len(starts) != 1 or len(ends) != 1:
+    if not starts or not ends:
         return None
+    # Elegimos el primer inicio de recuadro y el último cierre que esté debajo de él.
+    start = starts[0]
+    valid_ends = [e for e in ends if e[1] > start[3]]
+    if len(valid_ends) != 1:
+        return None
+    end = valid_ends[0]
     # Paso 2: comprobar que la forma es razonable: el final debajo del inicio y ambos más o menos alineados.
-    start, end = starts[0], ends[0]
     height = max(start[3] - start[1], end[3] - end[1])
-    if height <= 0 or end[1] <= start[3] or abs(start[2] - end[2]) > 2 * height:
+    if height <= 0 or end[1] <= start[3] or abs(start[2] - end[2]) > 3 * height:
         return None
     # Paso 3: el rectángulo, con un pequeño margen para no cortar las cifras.
     return pymupdf.Rect(
@@ -130,13 +141,13 @@ def _read_region(
 
 
 # Decide si la segunda lectura del cuadro se acepta y, si se acepta, reemplaza los importes de la página.
-# Sólo se acepta cuando el cuadro trae por sí mismo todos los importes necesarios,
+# Sólo se acepta cuando el cuadro trae por sí mismo los importes necesarios,
 # su total coincide con el de la página y la aritmética cuadra.
 def apply_amount_panel(result: ExtractionResult, layout: list[LayoutLine]) -> bool:
     """Acepta la lectura solo si el cuadro tiene sus propios importes y cuadra."""
     # Paso 1: extraer los importes del recuadro en un resultado aparte, sin tocar todavía el original.
     # Se ignoran los importes dudosos y los de detracción, retención, percepción, anticipos y total a pagar.
-    panel = ExtractionResult(currency=result.currency)
+    panel = ExtractionResult(currency=result.currency, document_type=result.document_type)
     lines = [line.text for line in layout]
     for index, line in enumerate(lines):
         for field, observed, currency, dudoso in amount_mentions(line):
@@ -146,13 +157,23 @@ def apply_amount_panel(result: ExtractionResult, layout: list[LayoutLine]) -> bo
                 panel, field, observed, index, lines, result.page_start, result.block_start,
                 {}, layout, currency, source="ocr_recuadro_importes",
             )
+    # También emparejar rótulos y cifras en columnas dentro del propio recuadro si quedaron separados.
+    for field, observed, currency, dudoso, lbl_idx, val_idx in pair_columnar_amounts(layout):
+        if dudoso or field in SETTLEMENT_FIELDS or field in {"anticipos", "total_a_pagar"}:
+            continue
+        if getattr(panel, field) is None and not panel.candidates.get(field):
+            _record_amount_field(
+                panel, field, observed, val_idx, lines, result.page_start, result.block_start,
+                {}, layout, currency, source="ocr_recuadro_importes",
+            )
+
     # Paso 2: condiciones para aceptar. El total del recuadro es el mismo que el de la página,
-    # trae todos los importes requeridos y la aritmética cuadra.
+    # trae al menos una base + IGV + total y la aritmética cuadra por sí misma.
     if not result.total or panel.total != result.total:
         return False
-    if any(getattr(panel, field) is None for field in _REQUIRED_FIELDS):
+    if panel.igv is None or not any(getattr(panel, b) is not None for b in _PANEL_BASE_FIELDS):
         return False
-    if reconcile_amounts(panel)["status"] != "cuadra":
+    if not reconcile_amounts(panel).get("consistent"):
         return False
 
     # Paso 3: probamos primero sobre una copia que sustituye los importes por los del recuadro,
@@ -167,7 +188,7 @@ def apply_amount_panel(result: ExtractionResult, layout: list[LayoutLine]) -> bo
             for original in combined.field_evidence.get(field, [])
         ] + panel.field_evidence[field]
     revised = reconcile_amounts(combined)
-    if revised["status"] != "cuadra":
+    if not revised.get("consistent"):
         return False
     # Dejamos constancia de que este cuadre salió del recuadro.
     revised["reading_source"] = "Recuadro de importes"
@@ -209,7 +230,7 @@ def review_amount_panel(
     if not isinstance(engine, TesseractOCREngine) or page.source != "ocr" or not result.total:
         return None
     # Y sólo si la aritmética todavía no cuadra: si ya cuadra, no hay nada que mejorar.
-    if any(check["check"] == "arithmetic_total_reconciliation" and check["status"] == "cuadra" for check in result.derived_checks):
+    if any(check["check"] == "arithmetic_total_reconciliation" and check.get("consistent") for check in result.derived_checks):
         return None
     # Si no se encuentra el cuadro, no se hace nada.
     box = _panel_box(page.layout_lines)

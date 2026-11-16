@@ -37,11 +37,13 @@ class CompactFiscalUI:
         self.root.minsize(680, 420)
         self.root.resizable(True, True)
 
-        # Variables ligadas a los campos de la pantalla: carpetas, RUC y casilla de los ZIP.
+        # Variables ligadas a los campos de la pantalla: carpetas, padrón RUC opcional, RUC del comprador y casillas de ZIP/PDF.
         self.input_var = tk.StringVar(value=str(initial_input or Path.cwd() / "entrada"))
         self.output_var = tk.StringVar(value=str(initial_output or Path.cwd() / "salida"))
+        self.padron_var = tk.StringVar(value=str(self.config.padron_db_path) if self.config.padron_db_path else "")
         self.ruc_var = tk.StringVar()
         self.inspect_zip_var = tk.BooleanVar(value=self.config.inspect_archives)
+        self.export_pdf_var = tk.BooleanVar(value=self.config.export_pdf_folders)
 
         # Variables de los indicadores de avance y de los contadores.
         self.stage_var = tk.StringVar(value="Listo para iniciar")
@@ -88,8 +90,14 @@ class CompactFiscalUI:
         self.browse_out_btn = ttk.Button(paths_frame, text="Examinar...", command=self._browse_output)
         self.browse_out_btn.grid(row=1, column=2, padx=(6, 0), pady=2)
 
+        ttk.Label(paths_frame, text="Padrón RUC (.sqlite3):").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
+        self.padron_entry = ttk.Entry(paths_frame, textvariable=self.padron_var)
+        self.padron_entry.grid(row=2, column=1, sticky="ew", pady=2)
+        self.browse_padron_btn = ttk.Button(paths_frame, text="Examinar...", command=self._browse_padron)
+        self.browse_padron_btn.grid(row=2, column=2, padx=(6, 0), pady=2)
+
         opts_frame = ttk.Frame(paths_frame)
-        opts_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        opts_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Label(opts_frame, text="RUC receptor objetivo:").pack(side=tk.LEFT, padx=(0, 4))
         self.ruc_entry = ttk.Entry(opts_frame, textvariable=self.ruc_var, width=15)
         self.ruc_entry.pack(side=tk.LEFT, padx=(0, 14))
@@ -99,6 +107,12 @@ class CompactFiscalUI:
             variable=self.inspect_zip_var,
         )
         self.zip_chk.pack(side=tk.LEFT, padx=(0, 14))
+        self.pdf_chk = ttk.Checkbutton(
+            opts_frame,
+            text="Generar expediente PDF por proveedor",
+            variable=self.export_pdf_var,
+        )
+        self.pdf_chk.pack(side=tk.LEFT)
 
         # 2. Botones: iniciar, cancelar y abrir los resultados.
         btn_frame = ttk.Frame(main_frame)
@@ -185,6 +199,16 @@ class CompactFiscalUI:
         if selected:
             self.output_var.set(selected)
 
+    # Abre el selector de archivo para el Padrón RUC local en SQLite.
+    def _browse_padron(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="Elige la base SQLite del Padrón RUC (opcional)",
+            filetypes=[("Base SQLite", "*.sqlite3 *.sqlite *.db"), ("Todos los archivos", "*.*")],
+        )
+        if selected:
+            self.padron_var.set(selected)
+
     # Comprueba lo que escribió el usuario antes de empezar: las carpetas, que la salida no esté dentro de la entrada
     # y que el RUC sea válido. Si algo falla, lanza un ValueError con el motivo.
     def validate_inputs(self) -> tuple[Path, Path, str]:
@@ -229,11 +253,14 @@ class CompactFiscalUI:
         self._append_log(f"Salida configurada en: {output_path} | RUC receptor: {ruc}")
 
         inspect_zips = bool(self.inspect_zip_var.get())
+        export_pdfs = bool(self.export_pdf_var.get())
+        padron_raw = self.padron_var.get().strip()
+        padron_path = Path(padron_raw).resolve() if padron_raw else None
 
         # El análisis se hace en un hilo aparte para no congelar la ventana.
         self._worker = threading.Thread(
             target=self._run_worker,
-            args=(input_path, output_path, ruc, inspect_zips),
+            args=(input_path, output_path, ruc, inspect_zips, export_pdfs, padron_path),
             daemon=True,
         )
         self._worker.start()
@@ -253,6 +280,8 @@ class CompactFiscalUI:
         output_path: Path,
         ruc: str,
         inspect_zips: bool,
+        export_pdfs: bool,
+        padron_path: Path | None,
     ) -> None:
         try:
             # Se parte de los ajustes del config.json y se pisan el RUC y la casilla de ZIP con lo elegido en pantalla.
@@ -261,6 +290,8 @@ class CompactFiscalUI:
                 recipient_ruc=ruc,
                 inspect_archives=inspect_zips,
                 inspect_nested_archives=inspect_zips,
+                export_pdf_folders=export_pdfs,
+                padron_db_path=padron_path,
             )
             processor = FiscalProcessor(output_path, config)
 

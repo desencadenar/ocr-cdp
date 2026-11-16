@@ -1,280 +1,246 @@
 # OCR CDP
 
-Convierte un archivo digital de comprobantes de pago en una tabla de Excel. Lee el contenido de PDF digitales, PDF escaneados e imágenes como JPG, PNG, TIFF, BMP y WebP, también dentro de ZIP. Guarda el resultado en `CDP.xlsx` y señala qué página revisar cuando falta un dato. Los documentos se leen en tu equipo.
+Herramienta local en Python pensada para contabilidad y auditoría tributaria en Perú. Recorre carpetas y archivos ZIP con representaciones visuales de comprobantes de pago **sin XML** (PDF digitales, híbridos, escaneados e imágenes `JPG`, `JPEG`, `PNG`, `TIF`/`TIFF`, `BMP` y `WebP`), extrae sus campos clave sin inventar datos dudosos y genera:
+
+1. Un libro `CDP.xlsx` con seis pestañas orientadas al registro, revisión y *vouching* contable.
+2. Opcionalmente, una carpeta `expediente_pdf/` ordenada por proveedor con anexos vinculados y alertas de peso para Mesa de Partes Virtual (MPV) de SUNAT.
+
+Todo se procesa íntegramente en tu equipo, sin subir documentos a internet ni depender de servicios externos.
+
+---
 
 ## Empezar
 
-Necesitas Python 3.11, 3.12 o 3.13. Abre una terminal en la carpeta del proyecto y ejecuta:
+Necesitas **Python 3.11, 3.12 o 3.13**. Abre una terminal en la carpeta del proyecto y ejecuta:
 
 ```text
 python iniciar.py
 ```
 
-El mismo script prepara una carpeta local llamada `.venv`, instala las librerías que falten y abre una ventana. La primera vez necesita internet para descargar esas librerías. Después puedes volver a abrirlo con el mismo comando.
+Al ejecutarse, `iniciar.py` crea una carpeta local `.venv`, instala las dependencias fijas de `requirements.txt` (solo requiere internet la primera vez) y abre la ventana principal del programa. En adelante puedes volver a iniciarlo con el mismo comando.
 
-Para leer fotos y páginas escaneadas, instala [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html), que es el programa que convierte una imagen en texto. Activa español e inglés si vas a dejar los idiomas de fábrica. Si Tesseract falta, los PDF que ya contienen texto se siguen leyendo. Las páginas que necesitan el programa quedan señaladas en el Excel.
+Para leer fotos y PDF escaneados, instala [Tesseract OCR](https://tesseract-ocr.github.io/tessdoc/Installation.html) activando los idiomas español e inglés (`spa+eng`). Si Tesseract no está instalado, el sistema sigue leyendo normalmente los PDF que ya traen capa de texto digital y deriva a `revision` las páginas que requieren OCR.
 
-En la ventana, pulsa **Examinar** junto a **Carpeta de entrada** para elegir tus comprobantes. Pulsa **Examinar** junto a **Carpeta de salida** para elegir dónde guardar `CDP.xlsx`. Escribe el RUC del comprador que quieres comparar y pulsa **Iniciar análisis**. Al terminar, puedes abrir el libro desde la misma ventana.
+En la ventana gráfica puedes elegir:
+- **Carpeta de entrada** con tus comprobantes o ZIPs.
+- **Carpeta de salida** (vacía y fuera de la de entrada) donde se guardará `CDP.xlsx`.
+- **Padrón RUC (SQLite, opcional)** para contrastar razones sociales en local.
+- **RUC objetivo (receptor)** del contribuyente que estás auditando.
+- Si deseas inspeccionar contenedores **ZIP** y si deseas generar la carpeta ordenada **`expediente_pdf/`**.
 
 ## Abrir el proyecto en VS Code desde cero
 
-1. Instala [Visual Studio Code](https://code.visualstudio.com/), Python 3.11, 3.12 o 3.13 y, si vas a leer escaneos, Tesseract con los idiomas español e inglés.
-2. En VS Code, **Archivo → Abrir carpeta…** y elige la carpeta del proyecto, la que contiene `iniciar.py`.
-3. VS Code propondrá instalar las extensiones recomendadas del proyecto: **Python** y **Markdown Preview Mermaid Support**. Acepta las dos. Sin la segunda, la vista previa de Markdown muestra los diagramas como texto.
-4. Abre una terminal (**Terminal → Nuevo terminal**) y ejecuta `python iniciar.py`. La primera vez crea la carpeta `.venv`, instala las librerías con versiones fijas y abre la ventana del programa.
-5. Si VS Code pregunta con qué intérprete trabajar, elige el de `.venv` (`Ctrl+Shift+P` → *Python: Select Interpreter*).
-6. Para ver los diagramas, abre este `README.md` y pulsa `Ctrl+Shift+V`, o el icono de vista previa de la esquina superior derecha del editor.
-7. Con `F5` (**Ejecutar y depurar**) puedes abrir la ventana del programa con el depurador, o lanzar **Analizar una carpeta**, que te pregunta la carpeta de entrada, la de salida y el RUC.
+1. Instala [Visual Studio Code](https://code.visualstudio.com/), Python 3.11, 3.12 o 3.13 y Tesseract (`spa+eng`) si vas a procesar escaneos.
+2. En VS Code ve a **Archivo → Abrir carpeta…** y selecciona la carpeta raíz del proyecto (la que contiene `iniciar.py`).
+3. VS Code sugerirá las extensiones recomendadas en [extensions.json](.vscode/extensions.json): **Python** (`ms-python.python`) y **Markdown Preview Mermaid Support** (`bierner.markdown-mermaid`). Conviene aceptar ambas para ver el diagrama de este `README.md` (`Ctrl+Shift+V`).
+4. Abre una terminal integrada y ejecuta `python iniciar.py` para inicializar `.venv`. Luego selecciona el intérprete de `.venv` en VS Code (`Ctrl+Shift+P` → *Python: Select Interpreter*).
+5. Con `F5` puedes ejecutar las configuraciones predefinidas en [launch.json](.vscode/launch.json): abrir la ventana gráfica o lanzar un análisis directo por carpeta.
 
-En GitHub los diagramas se dibujan solos, sin extensiones.
+En GitHub los diagramas Mermaid se dibujan automáticamente sin instalar extensiones.
+
+---
+
+## Herramientas y librerías que utiliza
+
+| Componente | Para qué se usa en el proyecto | Dónde está definido |
+| --- | --- | --- |
+| `PyMuPDF` (`1.28.2`) | Lectura de texto nativo, detección de columnas y glifos dañados, renderizado de páginas para OCR, recorte/unión de PDFs en `expediente_pdf/`. | [requirements.txt](requirements.txt) |
+| `Pillow` (`12.3.0`) | Carga de imágenes y TIFF multipágina, corrección de orientación EXIF y recompresión adaptativa de imágenes hacia PDF. | [requirements.txt](requirements.txt) |
+| `openpyxl` (`3.1.5`) y `et-xmlfile` (`2.0.0`) | Construcción de `CDP.xlsx` (6 pestañas, formatos de texto, moneda y fechas reales) y plantillas de calibración. | [requirements.txt](requirements.txt) |
+| `Tesseract OCR` *(programa externo)* | Reconocimiento óptico de caracteres por subproceso con salida TSV palabra por palabra y detección automática de rotación (`--psm 0`). | Configurado en [config.json](config.json) |
+| Módulos estándar de Python | `sqlite3` (estado de corrida en `.ocr_fiscal/state.sqlite3` y Padrón RUC local), `zipfile` (apertura segura en memoria de ZIPs anidados), `tkinter` (ventana gráfica) y `unittest` (pruebas). | Biblioteca estándar de Python |
+| Extras opcionales del entorno | Si instalas por separado `zxingcpp` en tu Python, decodifica códigos QR SUNAT (incluso vectoriales); si instalas `pillow-heif`, admite imágenes `.heic`. | Opcionales (no incluidos en [requirements.txt](requirements.txt)) |
+
+---
 
 ## Mapa de lo que hace
 
 ```mermaid
 flowchart TD
-    A["Eliges la carpeta de comprobantes y la carpeta de salida"] --> B["Recorre el repositorio y registra los formatos"]
-    B --> C{"¿El PDF tiene texto utilizable?"}
-    C -->|Sí| D["Lee el texto del PDF"]
-    C -->|No| E["Lee la imagen con Tesseract"]
-    D --> F{"¿Se ve el título del comprobante y hay datos que lo respaldan?"}
-    E --> F
-    F -->|Sí| G["Extrae la descripción de la operación y el detalle de productos o servicios"]
-    G --> N["Lee los RUC, la fecha, la serie y el número, los importes y las leyendas de detracción y retención"]
-    F -->|Faltan datos| H["Registra la página y el fragmento que necesita revisión"]
-    N --> I["Contrasta los RUC, revisa los importes y reúne las copias del mismo comprobante"]
-    I --> O["Ordena por RUC emisor, serie y número"]
-    O --> J["Guarda CDP.xlsx en la carpeta de salida"]
-    H --> J
-    H -.-> R["Propuesta no implementada: RAG con un LLM externo opcional"]
-    R -.-> V["Comparar la sugerencia con el fragmento del comprobante"]
-    V -.-> J
+    A["Carpeta de entrada y ajustes en config.json"] --> B["Recorre archivos y ZIPs anidados con topes de seguridad"]
+    B --> C{"¿Qué formato tiene el archivo?"}
+    C -->|"XML"| D["Se excluye por formato y queda anotado en inventario"]
+    C -->|"PDF o imagen"| E{"¿El PDF tiene texto digital utilizable?"}
+    E -->|"Sí"| F["Extrae líneas, columnas y diseño con PyMuPDF"]
+    E -->|"No o página mixta"| G["Renderiza a imagen y ejecuta Tesseract OCR"]
+    F --> H["Lee códigos QR SUNAT si zxingcpp está disponible"]
+    G --> H
+    H --> I["Segmenta bloques y separa documentos de soporte no tributarios"]
+    I --> J{"¿Cómo clasifica el bloque?"}
+    J -->|"Soporte no CDP"| K["Registra soporte: guía, OC, HES, estado bancario o constancia SPOT"]
+    J -->|"Indeterminado o error de lectura"| L["Deriva a revision con página y fragmento para cotejo manual"]
+    J -->|"CDP detectado (17 tipos SUNAT)"| M["Extrae identidad, RUC/DNI, glosa, ítems y datos de OC, Guía, Placa y SPOT"]
+    M --> N["Cuadra importes con tolerancia y evalúa tasa IGV (18%, Rég. esp. restaurantes/hoteles 10/10.5/15%, IVAP 4%, 0%)"]
+    N --> O["Reconcilia con Padrón RUC local, coteja QR y deduplica copias por clave fiscal"]
+    O --> P["Genera CDP.xlsx con 6 pestañas y trazabilidad por id_documento"]
+    O --> Q["Opcional: construye expediente_pdf/ ordenado por proveedor y topes 10 MB MPV"]
+    K --> P
+    K --> Q
+    L --> P
+    L --> Q
 ```
 
-El libro contiene cinco pestañas, con nombres de columnas y estados en español y palabras separadas por guiones bajos.
+---
+
+## Qué entrega en `CDP.xlsx`
+
+El libro generado contiene **seis pestañas**, con encabezados en minúsculas separados por guiones bajos y una columna común `id_documento` para cruzar cualquier fila entre hojas:
 
 | Pestaña | Qué contiene y para qué sirve |
 | --- | --- |
-| `cdp_detectados` | Una fila por representación principal de cada comprobante identificado. Muestra emisor, receptor, descripción, fechas, importes y ubicación del original. |
-| `notas` | Notas de crédito y débito y la referencia al comprobante afectado cuando se puede leer. |
-| `revision` | Datos incompletos, lecturas dudosas, importes que requieren cotejo y documentos cuyo tipo no pudo identificarse. Incluye la ubicación y el fragmento disponible. |
-| `inventario` | Archivos y miembros de ZIP encontrados, su estado y las exclusiones, como XML y HES. Permite comprobar qué se procesó y qué quedó fuera. |
-| `resumen` | Totales y estado de la corrida. Aparece al final del libro. |
+| `cdp_detectados` | Una fila por representación principal de cada comprobante detectado (salvo notas `07` y `08`). Incluye RUC y razón social observada, tipo/serie/correlativo, emisión, vencimiento, condición de pago, cuotas, documento del adquirente (`RUC` o `DNI`), bases e importes, cuadre aritmético, tasa efectiva y control de IGV, `apto_credito_fiscal_preliminar`, `alerta_bancarizacion`, referencias citadas (`orden_de_compra_citada`, `guia_de_remision_citada`, `placa_vehicular`), datos SPOT (`%`, código y cuenta BN), cotejo con Padrón RUC al corte, peso del PDF en MB, alerta `>10 MB MPV` y anexos vinculados del mismo PDF. |
+| `notas` | Notas de crédito (`07`) y débito (`08`) con el código y motivo SUNAT leído, uno o varios comprobantes afectados citados, si dichos comprobantes aparecen dentro del lote del mismo emisor, e importes con signo negativo en notas de crédito. |
+| `revision` | Todo hallazgo que exige verificación visual humana con ubicación exacta y fragmento: lecturas con baja confianza OCR, identidades incompletas o en conflicto, diferencias aritméticas o de suma de ítems, RUC adquirente distinto del objetivo, posible venta propia mezclada, RUC ausente en padrón local, diferencias contra QR SUNAT, tasas IGV atípicas, RHE mayores a S/ 1,500 sin retención ni mención de suspensión (Form. 1609) y PDFs que superan 10 MB. |
+| `inventario` | Inventario completo de archivos físicos y miembros de ZIP revisados, formatos excluidos (como XML), incidencias de contenedores (cifrados, corruptos o límites) y bloques descartados como soportes no CDP (`no_cdp`) indicando si quedaron archivados o vinculados a un comprobante. |
+| `detalle_items` | Desglose fila por fila de productos o servicios leídos dentro de la tabla del comprobante (`id_documento`, clave fiscal, cantidad numérica preservando `0.0`, unidad, descripción, valor unitario, descuento e importe de línea), útil para clasificar cuentas del Plan Contable o centros de costo. |
+| `resumen` | Totales de la corrida, contadores de revisión/tercero/`>10 MB`, canal de verificación y advertencias explícitas de alcance legal y tributario. Aparece siempre al final del libro. |
 
-La descripción se toma de la glosa impresa o de las filas reconocibles del detalle. Las fechas se guardan como fechas de Excel y se muestran como **DD/MM/AAAA**. El programa puede recorrer carpetas con formatos mezclados. Para extraer el contenido de un formato nuevo hace falta añadir y probar su lector.
+---
 
-Cuando la fecha de emisión no se lee, la celda queda vacía: el programa no la deduce del nombre del archivo ni de otro comprobante. Esa ausencia aparece además como un hallazgo en `revision`, con la página donde buscarla en el original.
+## Cobertura tributaria, tasas de IGV y cuadre de importes
 
-`denominacion_observada` muestra el título del documento tal como se lee en la página, por ejemplo `FACTURA ELECTRÓNICA`. En muchos comprobantes el título comparte renglón con el teléfono, el RUC o el nombre del emisor porque están en columnas distintas; en ese caso la columna `evidencia_de_la_denominacion` conserva el renglón completo del que salió, para que puedas cotejarlo. Si el renglón ya contenía sólo el título, esa columna queda vacía. Ningún carácter se completa ni se corrige: si el título viene mal leído, se muestra mal leído.
+### Comprobantes SUNAT reconocidos (17 códigos)
+- `01` Factura
+- `02` Recibo por honorarios
+- `03` Boleta de venta *(incluye captura de `DNI` de 8 dígitos del cliente cuando no hay RUC)*
+- `04` Liquidación de compra
+- `05` Boleto de transporte aéreo *(incluye «Comprobante de compra» aéreo con contexto IATA/ticket)*
+- `07` Nota de crédito
+- `08` Nota de débito
+- `10` Recibo por arrendamiento (Formulario Virtual 1683)
+- `12` Ticket de máquina registradora
+- `13` Documento autorizado SBS *(diferenciado de estados de cuenta bancarios cuando incluye RUC + IGV)*
+- `14` Recibo por servicios públicos *(protegido contra falsos descartes cuando menciona saldo o estado de cuenta anterior)*
+- `16` Boleto de viaje terrestre
+- `20` Comprobante de retención
+- `40` Comprobante de percepción
+- `50` Declaración Aduanera de Mercancías (DUA/DAM)
+- `52` Despacho simplificado aduanero
+- `54` Liquidación de cobranza aduanera
 
-`estado_oficial` dice `pendiente` en todos los comprobantes detectados. Este programa **no** consulta la validez de emisión en SUNAT: detectar un documento y verificar oficialmente que fue emitido son dos cosas distintas, y aquí sólo se hace la primera. El `resumen` lo repite en «Canal oficial de validación» y en «CDP confirmados oficialmente».
+En tipos extendidos (`05`, `10`, `12`, `13`, `14`, `16`, `50`, `52`, `54`) el correlativo admite hasta 20 dígitos ASCII sin truncarse; en tipos estándar (`01`, `02`, `03`, `04`, `07`, `08`, `20`, `40`) exige entre 1 y 8 dígitos y los normaliza a 8 posiciones.
 
-La columna `razon_social_observada` queda vacía cuando la lectura no identifica con suficiente claridad el nombre del emisor en el comprobante. El RUC por sí solo no rellena ese campo, y el programa no deduce el nombre por su posición en la página. Cuando queda vacía, lo anota como hallazgo en `revision`. Si configuras un padrón compatible, el nombre registrado aparece en la columna `razon_social_del_padron`, aparte, para que lo compares con el original: es una comparación, no un relleno.
+### Control de tasa efectiva de IGV (informativo)
+Esta validación vive y se configura directamente en la función `evaluate_igv_rate` de [amounts.py](src/ocr_fiscal/amounts.py) (sin requerir parámetros extra en [config.json](config.json)). Además del cuadre aritmético exacto, contrasta la tasa conjunta facturada (**IGV + IPM**) frente a las tasas vigentes en Perú:
+- **18 %**: tasa estándar del Régimen General (aun cuando la Ley N.° 32387 redistribuya gradualmente puntos entre IGV e IPM, el total facturado sigue siendo `18 %`).
+- **Tasa especial del IGV para restaurantes, hoteles y alojamientos turísticos (Ley N.° 31556 y modificatoria Ley N.° 32219, junto al IPM de la Ley N.° 32387):** **10 %** hasta 2025 (`8 % IGV + 2 % IPM`), **10.5 %** en 2026 (`8 % IGV + 2.5 % IPM`) y **15 %** en 2027 (`12 % IGV + 3 % IPM`), retornando a `18 %` desde 2028 salvo prórroga (en notas `07` y `08` también se toleran tasas de años previos). **Importante:** este régimen **no aplica a cualquier MYPE**; solo alcanza a micro y pequeñas empresas (ingresos hasta `1,700 UIT` y sin vinculación con grandes grupos) cuyo giro principal —mínimo `70 %` de sus ingresos— sea restaurantes, hoteles o alojamientos turísticos, excluyendo servicios de *catering* y concesionarios de alimentos. Como la herramienta no consulta la ficha RUC/CIIU de actividad del emisor, acepta numéricamente estas tasas cuando coinciden con el año de emisión y deja la verificación del giro del proveedor al auditor contable.
+- **4 %**: tasa especial del IVAP.
+- **0 %**: operaciones exoneradas, inafectas o de exportación (y reconocimiento específico de IGV referencial en transferencias gratuitas sin derecho a crédito fiscal).
 
-El programa reconoce el nombre del emisor por la forma societaria que lo cierra, con puntos (`S.A.`, `S.A.C.`, `S.A.A.`, `S.R.L.`, `E.I.R.L.`) o sin ellos (`SAC`, `SAA`, `SRL`, `EIRL`). Quedan fuera tres situaciones, todas propias de páginas escaneadas:
+Si una tasa no corresponde a ninguno de los supuestos esperados, no se altera el cuadre aritmético, pero se deja constancia en `control_tasa_igv` y en `revision`.
 
-- **El escáner leyó mal la forma societaria**, por ejemplo `S.A,` con coma, `EARL` en lugar de `EIRL` o `SAL` en lugar de `SAC`. El programa no da por buena una abreviatura que no reconoce, porque corregirla sería suponer qué decía el papel.
-- **El emisor es una persona natural** (su RUC empieza por 10). Entonces no hay forma societaria: lo que figura es un nombre propio, a veces junto a un nombre comercial. El programa no elige entre los dos.
-- **Sólo aparece el nombre comercial** y el nombre registrado no está impreso en la página.
+### Reglas y casos especiales en el cuadre (`amounts.py`)
+- Tolerancia de redondeo configurable mediante `tolerancia_redondeo` (`0.02` por defecto), marcando el resultado como `cuadra_con_redondeo` cuando aplica.
+- Soporte explícito para operaciones 100 % gratuitas, percepción sumada o detracción restada sobre `total_a_pagar`, RHE con retención del 8 % (inclusive entre paréntesis), ISC incluido en la base imponible, FISE contenido en operaciones inafectas, anticipos deducidos al pie, signos mixtos en Notas de Crédito y Nota de Crédito Tipo 13 en cero.
+- Si `currency` resulta contradictorio dentro del bloque (`S/` y `USD` mezclados) o el OCR pega símbolos ambiguos de moneda al primer dígito (por ejemplo `$755.00`), el dato se deja en blanco para revisión en lugar de suponerse.
 
-En los tres casos la celda queda vacía a propósito y el hallazgo te dice en qué página mirar.
+---
 
-Por ejemplo, si lee una base de S/ 100 y un IGV de S/ 18, compara S/ 118 con el total impreso. Si aparecen importes inafectos, exonerados, no gravados o descuentos, los muestra por separado. Una cifra que falta queda en blanco. Las leyendas de detracción y retención se muestran tal como se encontraron en el comprobante.
+## Organización opcional en `expediente_pdf/`
 
-## Propuesta: RAG con un LLM externo (no implementado)
+Cuando activas `--exportar-pdf` en consola, la casilla correspondiente en la ventana o `"exportar_pdf_ordenado": true` en [config.json](config.json), se genera la subcarpeta `expediente_pdf/` con esta estructura:
 
-> **Estado.** Esto es una guía de diseño. El programa **no** incluye RAG, no se conecta a ningún modelo, no hace llamadas de red y no necesita claves. Se explica aquí qué sería y cómo se construiría, para quien quiera implementarlo, discutirlo o descartarlo con criterio.
+- `01_cdp_por_proveedor/<RUC>-<PROVEEDOR>/<RUC>-<TIPO>-<SERIE>-<CORRELATIVO>.pdf`: comprobantes con identidad completa y sin alertas bloqueantes. Por defecto incluye también sus notas `07` y `08` en la misma carpeta del proveedor (`unificar_notas_en_proveedor: true`). Si un mismo PDF contenía anexos contiguos clasificados como soporte (guía, OC, constancia SPOT), los extrae en `<clave>_SOPORTES_pX-Y.pdf` dentro de la misma carpeta del proveedor en lugar de separarlos.
+- `02_notas_por_proveedor/`: se usa para las notas `07`/`08` solo cuando configuras `"unificar_notas_en_proveedor": false`.
+- `03_revision_pendiente/`: comprobantes incompletos, indeterminados, conflictos de clave o colisiones (`COLISION_`), más derivaciones automáticas por riesgo tributario directo con prefijo visible: `TERCERO_` (RUC receptor distinto al objetivo), `VENTA_PROPIA_` (RUC emisor igual al RUC objetivo en un lote de compras) y `QR_DIFIERE_` (diferencia entre el QR SUNAT y el texto extraído).
+- `04_soportes_no_cdp/`: documentos de soporte sueltos (guías, OC, HES, estados de cuenta bancarios, constancias SPOT) que llegaron en archivos separados sin un CDP apto en el mismo PDF.
+- `05_duplicados_secundarios/`: copias secundarias concordantes cuando el mismo comprobante vino repetido en carpeta y en ZIP.
 
-### Qué es un RAG
+Las imágenes convertidas a PDF se recomprimen adaptativamente si superan **10 MB** (límite usual de Mesa de Partes Virtual SUNAT) y todo PDF exportado que supere ese peso queda marcado en `cdp_detectados` y `revision`.
 
-RAG significa *retrieval-augmented generation*: generación apoyada en una búsqueda previa. Antes de preguntarle algo a un modelo de lenguaje, el programa busca en una colección propia los fragmentos más parecidos a lo que se pregunta y se los entrega como contexto. El modelo no aprende nada por ello: sólo lee lo que se le pasa en esa consulta.
+---
 
-Dos cosas que conviene tener claras desde el principio:
+## Alcance y qué no hace el programa
 
-- Un ejemplo recuperado enseña **cómo suele estar distribuida** una página. No es prueba de nada sobre el comprobante que tienes delante.
-- Si al modelo sólo se le entrega texto, no puede recuperar lo que el OCR ya perdió. Si el escáner leyó `$755.00` donde el papel decía `S/ 55.00`, el modelo recibe `$755.00`. Para eso haría falta enviar el recorte de la imagen, con las consecuencias de privacidad que se explican más abajo.
+- **No valida emisión oficial en SUNAT:** `estado_oficial` figura siempre como `pendiente` y «CDP confirmados oficialmente» en `resumen` es `0`. El programa no se conecta a Clave SOL ni a API CPE.
+- **El Padrón RUC local es estático:** si configuras una base SQLite creada con `preparar-padron`, solo sirve para comprobar existencia del RUC en esa instantánea, comparar razón social de emisor y receptor (tolerando ruido leve de OCR, abreviaturas y orden invertido en RUC `10`, además de distinguir `posible_nombre_comercial` frente a `discrepancia`), y mostrar estado/condición referencial **a la fecha de corte del padrón**. No acredita `HABIDO` ni `ACTIVO` vigente en la fecha real de emisión.
+- **No reemplaza el control tributario ni la fehaciencia:** columnas como `apto_credito_fiscal_preliminar` y `alerta_bancarizacion` (umbral Ley 28194: `>= S/ 2,000` o `>= US$ 500`) son alertas preventivas para facilitar el *vouching*; no comprueban pago bancarizado real, depósito de detracción SPOT ni causalidad del gasto.
+- **Privacidad total sin IA ni red externa:** todo corre localmente en tu equipo. El sistema no integra modelos LLM ni RAG, no realiza llamadas de red ni envía documentos o fragmentos fuera de tu computadora.
 
-### Dónde ayudaría y dónde no
+---
 
-| Caso | ¿Reglas locales o RAG? |
-| --- | --- |
-| Dígito verificador del RUC, formato de fechas y números, cuadre de importes | **Reglas locales.** Son comprobaciones exactas; un modelo sólo añadiría error. |
-| Ruido del OCR entre una etiqueta y su valor, símbolo de moneda mal leído, corte de página | **Reglas locales.** Son defectos de lectura, no de interpretación. |
-| Quién es el emisor y quién el receptor cuando el diseño de la página es inusual | Candidato a RAG: depende de la disposición. |
-| Descripciones partidas en varias líneas o pegadas a cifras | Candidato a RAG, con el recorte de imagen. |
-| Etiquetas con nombres poco habituales (fecha, moneda, leyendas de detracción) | Candidato a RAG. |
-| Elegir entre nombre comercial y razón social registrada | Mejor el padrón local (`razon_social_del_padron`): contrasta con una fuente en lugar de opinar. |
+## Ajustar la lectura (`config.json`)
 
-La regla práctica: si existe una comprobación exacta, se usa. El modelo se reserva para lo que depende de la disposición de la página y que hoy el lector deja en `revision`.
+Abre [config.json](config.json) con cualquier editor de texto y cambia el valor a la derecha de la llave. Un formato JSON inválido indica la línea y columna a corregir.
 
-### Cómo se construiría, paso a paso
-
-```mermaid
-flowchart TD
-    A["El lector local marca un campo dudoso"] --> B["Se prepara el recorte, el texto, la página y las coordenadas"]
-    B --> C{"¿Hay ejemplos revisados parecidos?"}
-    C -->|"Sí"| D["Se recuperan uno o dos con su identificador y procedencia"]
-    C -->|"No"| E["La consulta va sin ejemplos"]
-    D --> F["La persona ve exactamente lo que se enviaría"]
-    E --> F
-    F -->|"No confirma"| H["El campo queda en revisión"]
-    F -->|"Confirma"| G["Consulta al LLM externo con tope de gasto y de tiempo"]
-    G -->|"Falla el proveedor"| J["El fallo se ve en el Excel y el campo queda en revisión"]
-    G --> I["Propuesta por campo: valor, fragmento, página, ubicación e incertidumbre"]
-    I --> K{"¿La validación local la respalda el documento actual?"}
-    K -->|"Sí"| L["Se anota como propuesta, con su evidencia"]
-    K -->|"No"| H
-```
-
-**1. Reunir el corpus de ejemplos.** Cada ejemplo es un par: una región de un comprobante (texto o recorte) y el valor correcto, **revisado por una persona contra el original**. Cada uno lleva un identificador, su procedencia y la fecha de revisión. Reglas que no se negocian:
-
-- Sólo entran ejemplos revisados a mano. Indexar las salidas sin revisar del propio programa contaminaría el corpus con sus errores.
-- El corpus **no vive en el repositorio público**. Contiene datos reales de terceros. Cada quien mantiene el suyo.
-
-**2. Partirlo en trozos pequeños.** Un ejemplo es una región con sentido (la cabecera con el título y el RUC, el bloque de importes, la zona de leyendas), no una página entera. Se guardan metadatos: tipo de campo, si el original era digital o escaneado, calidad. Con trozos pequeños, un ejemplo recuperado aporta estructura y no arrastra valores ajenos.
-
-**3. Elegir cómo buscar.** Hay dos caminos, y conviene empezar por el más simple:
-
-- *Búsqueda por palabras y por metadatos* (por ejemplo, SQLite con FTS5, que el proyecto ya usa para guardar su estado). Con cientos de ejemplos suele bastar y es fácil de auditar: se ve por qué salió cada resultado.
-- *Búsqueda por vectores* (embeddings), con un modelo de embeddings propio o de un servicio, y un índice como `sqlite-vec` o FAISS. Se añade sólo si la medición demuestra que mejora lo anterior.
-
-**4. Recuperar poco.** Uno a tres ejemplos como máximo y con un umbral de parecido: si ninguno lo supera, la consulta va sin ejemplos. Más contexto no es mejor contexto.
-
-**5. Construir la consulta.** Instrucciones fijas, el campo que se pide, el fragmento actual y, aparte, los ejemplos, delimitados de forma explícita como *ejemplos de estructura, no datos del documento*. Se pide la respuesta en un formato estructurado.
-
-**6. Pedir una respuesta estructurada.** Una propuesta por campo, con su respaldo. El esquema, con marcadores en lugar de datos:
-
-```json
-{
-  "campo": "<nombre del campo pedido>",
-  "propuesta": "<texto tal como se lee en el documento>",
-  "pagina": 1,
-  "fragmento_de_respaldo": "<renglón del documento actual>",
-  "ubicacion": [0, 0, 0, 0],
-  "incertidumbre": "baja | media | alta",
-  "ejemplos_usados": ["<identificador del ejemplo>"]
-}
-```
-
-**7. Validar en local, siempre.** Cada propuesta se comprueba contra el documento actual: sintaxis y dígito verificador del RUC, rol de emisor o receptor, que la fecha sea posible y esté escrita en la página, que la etiqueta exista, y la aritmética con decimales. Validar el formato o la suma no sustituye a la evidencia visual. Si hay conflicto o falta respaldo, el campo queda pendiente de revisión. Un valor que aparezca en un ejemplo recuperado pero **no** en el fragmento actual se rechaza: es la huella de una contaminación.
-
-**8. Dejar rastro.** Cada consulta guarda qué ejemplos se usaron, qué proveedor y modelo respondió, la versión de las instrucciones, el coste y el resultado de la validación. Sin ese registro no se puede auditar después.
-
-### Cómo se configuraría
-
-El proveedor y el modelo no irían escritos en el código: serían ajustes, con la función **apagada de fábrica**. Un esquema posible para `config.json`, que hoy **no existe**:
-
-| Ajuste propuesto | Para qué serviría |
-| --- | --- |
-| `llm_activado` | Interruptor general. Valor inicial `false`. |
-| `llm_proveedor` y `llm_modelo` | Elegir a quién se consulta y con qué modelo. Detrás habría una interfaz común para poder cambiar de proveedor sin tocar el resto. |
-| `llm_tope_gasto` | Límite de coste por lote. Al alcanzarlo, la función se detiene. |
-| `llm_segundos_maximos` | Tiempo máximo de espera por consulta. |
-
-La clave del servicio se leería de una variable de entorno. Nunca iría en `config.json` ni en el repositorio.
-
-Un modelo que se ejecute en tu propio equipo es una alternativa válida cuando los documentos no pueden salir de él: se renuncia al coste por consulta y a la salida de datos, a cambio de hardware y, normalmente, de algo menos de calidad. La interfaz común permitiría usar uno u otro.
-
-### Privacidad: qué implica enviar un comprobante
-
-Un comprobante contiene datos de tus proveedores y de tus clientes. Enviarlo a un servicio externo significa sacarlo de tu equipo. Si se implementara, tendría que cumplir:
-
-- Estar apagado hasta que alguien lo encienda a propósito.
-- Mostrar en pantalla, antes de la primera consulta, **exactamente** lo que se enviaría: el texto o el recorte, con su archivo y su página. Sin confirmación no sale nada.
-- Enviar sólo lo necesario para el campo dudoso, nunca el comprobante entero ni la carpeta.
-- Tratar lo que devuelva el modelo como dato, jamás como instrucción: un texto incrustado en un comprobante o en un ejemplo no puede cambiar lo que hace el programa.
-- Hacer visible cualquier fallo del proveedor en el Excel. Nunca convertirlo en una confirmación silenciosa.
-- No decidir la validez oficial de ningún comprobante. Eso queda fuera del alcance de este programa, con o sin RAG.
-
-### Cómo se mediría antes de usarlo
-
-Un RAG sólo se justifica si mejora algo medible. Para comprobarlo hace falta:
-
-- **Una referencia revisada contra los originales**, con la procedencia de cada valor. El programa ya incluye el mecanismo para compararla con la lectura (`plantilla-calibracion` y `calibrar`, más abajo).
-- **Dos conjuntos separados**: el de los ejemplos que alimentan el corpus y el de evaluación. Evaluar con documentos cuyos ejemplos están en el corpus daría una cifra inflada.
-- **La misma muestra y los mismos criterios** con y sin RAG. Se mide por campo: cuántos acierta, cuántos erra, cuántos deja vacíos, cuántos valores falsos introduce y cuántas propuestas rechaza la validación local.
-- **El coste**: consultas por cada mil comprobantes multiplicadas por el precio vigente del proveedor elegido, que cambia y hay que consultar en su momento.
-
-Una bajada del número de alertas no cuenta como mejora por sí sola: lo que importa es que lo recuperado sea correcto y que no aparezcan valores falsos.
-
-## Ajustar la lectura
-
-Abre [config.json](config.json) con un editor de texto. Cambia solo el valor a la derecha de cada nombre. Por ejemplo, para que el programa no abra el contenido de los ZIP, cambia `true` por `false` en `revisar_archivos_zip`. Guarda el archivo y vuelve a abrir el programa. Un archivo mal escrito muestra la línea que debes revisar.
-
-| Ajuste | Valor inicial | Qué pasa si lo cambias |
+| Ajuste | Valor inicial | Qué controla |
 | --- | --- | --- |
-| `ruta_tesseract` | `"auto"` | Busca Tesseract en el equipo. Si está en otra carpeta, escribe la ruta entre comillas. En Windows puedes escribirla con barras normales, por ejemplo `"C:/Program Files/Tesseract-OCR/tesseract.exe"`. |
-| `idiomas_ocr` | `"spa+eng"` | Lee texto de imágenes en español e inglés. Usa `"spa"` si solo instalaste español. Cada idioma que indiques debe estar disponible en Tesseract. |
-| `segundos_por_pagina` | `90` | Es el tiempo máximo que Tesseract puede dedicar a una página. Admite enteros desde 1. Un valor mayor da más tiempo a páginas difíciles. Si se agota, la página queda en **Revisión**. |
-| `umbral_confianza_ocr` | `70` | Va de 0 a 100. Si un dato clave leído en una imagen obtiene una puntuación menor, aparece en **Revisión**. Al subirlo, verás más alertas. La cifra leída y el tipo de documento se conservan. |
-| `resolucion_pdf` | `220` | Es el nivel de detalle con que se prepara una página PDF para leerla como imagen. Admite enteros de 72 a 600. Un valor mayor puede ayudar con letras pequeñas y también consume más tiempo y memoria. Los PDF con texto utilizable se leen directamente. |
-| `maximo_pixeles` | `40000000` | Es el tamaño máximo de imagen que se admite para leerla. Admite enteros desde 1. Si una imagen supera el límite, queda en **Revisión**. Aumentarlo permite imágenes más grandes y puede requerir más memoria. |
-| `releer_recuadro_importes` | `false` | Usa `true` para probar una lectura adicional del cuadro de importes en facturas escaneadas de una sola página. Se aplica cuando el cuadro tiene límites claros y el cuadre quedó pendiente. Excel indica **Recuadro de importes** si las cifras leídas cuadran y el total coincide con el de la página. |
-| `revisar_archivos_zip` | `true` | Usa `false` para omitir el contenido de los ZIP. La ventana permite cambiar esta opción para la corrida actual. |
-| `padron_ruc` | `null` | Puedes escribir la ruta de una base local compatible para comparar la razón social asociada al RUC leído. Usa `null` para procesar sin padrón. El padrón se usa solo para el nombre. |
+| `ruta_tesseract` | `"auto"` | Ruta al ejecutable `tesseract`. Con `"auto"` lo busca en `TESSERACT_CMD`, `PATH` o carpetas estándar de Windows. |
+| `idiomas_ocr` | `"spa+eng"` | Idiomas de Tesseract separados por `+` (deben estar instalados en el equipo). |
+| `segundos_por_pagina` | `90` | Tiempo máximo (entero ≥ 1) que Tesseract puede tardar por página antes de mandar la página a `revision`. |
+| `umbral_confianza_ocr` | `70` | Puntaje mínimo (`0` a `100`). Las lecturas clave por debajo del umbral conservan lo leído y generan hallazgo en `revision`. |
+| `resolucion_pdf` | `220` | DPI (`72` a `600`) con los que se renderiza cada página PDF que necesite OCR. Los PDF con texto digital suficiente no pasan por OCR. |
+| `maximo_pixeles` | `40000000` | Límite de píxeles permitido por imagen. Las imágenes mayores no se leen y van a `revision`. |
+| `releer_recuadro_importes` | `false` | Con `true`, intenta una segunda lectura a mayor resolución sobre el recuadro de importes en facturas escaneadas de una sola página cuyo cuadre falló. |
+| `revisar_archivos_zip` | `true` | Abre contenedores `.zip` (y ZIPs anidados) aplicando límites de profundidad, miembros, tamaño total y razón de compresión. |
+| `exportar_pdf_ordenado` | `false` | Con `true`, genera automáticamente la carpeta `expediente_pdf/` al finalizar el análisis. |
+| `padron_ruc` | `null` | Ruta a la base SQLite local del Padrón RUC (`null` para procesar sin padrón). Las rutas relativas parten de la carpeta del JSON. |
+| `padron_dias_maximos` | `null` | Antigüedad máxima permitida del padrón en días (entero ≥ 1, o `null` sin límite). Si se excede, marca los RUC como `obsoleto`. |
+| `unificar_notas_en_proveedor` | `true` | Con `true`, agrupa las notas `07`/`08` dentro de `01_cdp_por_proveedor/`; con `false`, las separa en `02_notas_por_proveedor/`. |
+| `tolerancia_redondeo` | `0.02` | Diferencia máxima aceptada (`0` a `0.5`) entre el total calculado y el leído para considerar que cuadra con redondeo. |
 
-Las rutas relativas de estos ajustes se toman desde la carpeta del JSON. Los números se escriben sin comillas y `true`, `false` y `null` se escriben en minúsculas.
+---
 
-La resolución inicial de 220 DPI se eligió al comparar nueve documentos originales. Con los demás ajustes iguales, 220 DPI logró 90 coincidencias de 99 campos revisados y 300 DPI logró 84. Es una referencia para esa muestra. El umbral 70 determina cuándo se marca una lectura para revisión. En esa misma muestra, 70 y 80 produjeron dos alertas, mientras que 90 produjo siete. El umbral cambia las alertas y no mejora por sí mismo la lectura.
+## Uso desde la terminal
 
-Son nueve documentos y 99 campos: una muestra pequeña, elegida porque estaba revisada contra los originales. Esos números valen para esa muestra y no son una tasa de acierto del programa. Repitiendo hoy esa comparación con los mismos nueve documentos y la misma referencia, `releer_recuadro_importes` pasa de 91 a 93 campos de 99. Dos campos de diferencia en nueve documentos no bastan para recomendarlo para todo. Por eso viene apagado: enciéndelo si tus facturas escaneadas tienen el cuadro de importes bien delimitado, y compruébalo con tus propios documentos.
-
-De los seis campos que siguen sin coincidir en esa muestra, cuatro son del mismo comprobante escaneado, uno es un RUC con un dígito mal leído y el último es una palabra partida por el escáner (`aprobad o`). Ninguno se corrige a mano: quedan señalados en `revision`.
-
-### Limitación conocida: importes en facturas escaneadas
-
-Con los ajustes de fábrica (`releer_recuadro_importes` en `false`), una cifra de una factura escaneada puede salir mal leída y quedar escrita en la celda. El caso típico: el OCR lee el símbolo del sol («S/») como un `7` pegado al número. Por ejemplo (ilustrativo), `S/ 1,250.00` sale como `71,250.00`.
-
-Qué hace el programa y qué no puede hacer:
-
-- Si el símbolo queda pegado a la cifra (`$755.00`) o queda solo un `7` delante del importe, **no da la cifra por leída**: la celda queda vacía y la hoja `revision` la señala.
-- Si el `7` queda pegado al número y no hay ningún símbolo de moneda, el programa **no puede distinguirlo de una cifra real** y la deja escrita. En el caso observado, el cuadre de importes salió como `datos_insuficientes` y la hoja `revision` señaló que el valor de venta no coincidía con el subtotal.
-
-Qué conviene hacer:
-
-- Antes de confiar en un importe leído de un escaneo, mira que `cuadre_de_importes` diga `cuadra` y revisa la hoja `revision`. Coteja con el original usando el archivo, la página y el fragmento que acompañan a cada dato.
-- Prueba `releer_recuadro_importes` en `true`. Relee el cuadro de importes recortado y a mayor resolución (facturas escaneadas de una sola página), y solo acepta esa lectura si las cifras suman y el total coincide con el de la página. En el caso observado dio la cifra correcta. No es una garantía: compruébalo con tus propios documentos.
-
-## Usar el mismo script desde la terminal
-
-Reemplaza `RUC_RECEPTOR` por el número que quieres contrastar. Usa una carpeta de salida vacía y fuera de la carpeta de entrada.
+Reemplaza `RUC_RECEPTOR` por el RUC de 11 dígitos que deseas contrastar y usa siempre una carpeta de salida vacía y fuera de la carpeta de entrada:
 
 ```text
-python iniciar.py scan --input entrada --output salida --recipient-ruc RUC_RECEPTOR
+python iniciar.py scan --input entrada --output salida --recipient-ruc RUC_RECEPTOR --exportar-pdf
+python iniciar.py scan --input entrada --output salida --recipient-ruc RUC_RECEPTOR --padron-db padron.sqlite3 --exportar-pdf
 python iniciar.py export --output salida
 ```
 
-El segundo comando vuelve a crear el Excel usando el estado local de esa corrida. Para usar otro archivo de ajustes, agrega `--config ajustes.json` a `scan` o `ui`. Consulta los comandos disponibles con `python iniciar.py --help`.
+- `ui`: abre la ventana gráfica (es el comando por defecto si ejecutas `python iniciar.py` sin argumentos).
+- `scan`: procesa la carpeta de entrada y genera `CDP.xlsx` (con `--config`, `--padron-db`, `--no-inspect-archives` y `--exportar-pdf` opcionales).
+- `export`: regenera `CDP.xlsx` desde `.ocr_fiscal/state.sqlite3` sin volver a leer los PDF ni ejecutar OCR.
+- `preparar-padron`: convierte el archivo oficial `.txt` o `.zip` del Padrón Reducido de SUNAT a una base SQLite local lista para usar:
 
-### Comparar ajustes con una muestra
+```text
+python iniciar.py preparar-padron --input padron_reducido_ruc.zip --output padron.sqlite3
+```
 
-Crea la plantilla Excel y anota en ella lo que ves en los originales. En **Archivo**, pon el nombre relativo a la carpeta de muestra. Las páginas y los bloques empiezan en 1. Deja en blanco los campos que no quieras comparar. En **Detección**, usa `cdp_detectado`, `no_cdp`, `indeterminado` o `error_de_lectura`.
+- `plantilla-calibracion` y `calibrar`: permiten crear una referencia etiquetada manualmente y comparar distintos perfiles de `config.json` campo por campo:
 
 ```text
 python iniciar.py plantilla-calibracion --output referencia.xlsx
-python iniciar.py calibrar --input muestra --reference referencia.xlsx --output calibracion.xlsx --recipient-ruc RUC_RECEPTOR
+python iniciar.py calibrar --input muestra --reference referencia.xlsx --output calibracion.xlsx --recipient-ruc RUC_RECEPTOR --config config.json --config ajustes-b.json
 ```
 
-Si quieres comparar dos ajustes, copia `config.json` a `ajustes-alternativos.json` y cambia un solo valor. Agrega `--config config.json --config ajustes-alternativos.json` al segundo comando. El Excel te muestra qué lecturas coincidieron, qué cambió y cuánto tardó cada opción. Guarda los comprobantes y los Excel de trabajo fuera del repositorio público.
+---
+
+## Pruebas automáticas
+
+El repositorio incluye pruebas sintéticas locales (sin usar comprobantes reales ni exigir Tesseract ni conexión a red) en [test_ocr_fiscal.py](tests/test_ocr_fiscal.py). Para ejecutarlas:
+
+```text
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+*(En Linux o macOS usa `.venv/bin/python -m unittest discover -s tests -v`).*
+
+---
 
 ## Leer el código
 
-Los archivos de `src/ocr_fiscal` están comentados en español, paso a paso, como si se leyeran de arriba abajo: cada función dice qué hace y, dentro de ella, los pasos van numerados. El orden natural para entenderlo es este:
+Los archivos de [src/ocr_fiscal](src/ocr_fiscal) están comentados en español, paso a paso, explicando el criterio técnico y tributario detrás de cada bloque. El orden recomendado para recorrer el código es:
 
-1. `iniciar.py` y `cli.py`: por dónde entra el programa.
-2. `config.py`: los ajustes de `config.json`.
-3. `archives.py` y `documents.py`: recorrer carpetas y ZIP, y leer cada página (texto nativo del PDF u OCR).
-4. `extraction.py`: decidir qué es cada cosa en la página (tipo, RUC, serie, fecha, importes, detalle).
-5. `processor.py`: orquesta todo y reúne las copias del mismo comprobante.
-6. `exports.py`: arma `CDP.xlsx`.
+1. [iniciar.py](iniciar.py) y [cli.py](src/ocr_fiscal/cli.py): preparación del entorno `.venv` y subcomandos CLI.
+2. [ui.py](src/ocr_fiscal/ui.py) y [config.py](src/ocr_fiscal/config.py): ventana Tkinter y carga/validación de `config.json`.
+3. [models.py](src/ocr_fiscal/models.py) y [tax.py](src/ocr_fiscal/tax.py): estructuras de datos, catálogo de 17 tipos SUNAT, validación de RUC/DNI y normalización de correlativos.
+4. [archives.py](src/ocr_fiscal/archives.py) y [ocr.py](src/ocr_fiscal/ocr.py): recorrido seguro de carpetas/ZIPs e interfaz de subproceso con Tesseract.
+5. [documents.py](src/ocr_fiscal/documents.py) y [amount_panel.py](src/ocr_fiscal/amount_panel.py): decisión entre texto nativo PyMuPDF y OCR, lectura de QR y relectura opcional de recuadro de importes.
+6. [amounts.py](src/ocr_fiscal/amounts.py), [visible.py](src/ocr_fiscal/visible.py) y [extraction.py](src/ocr_fiscal/extraction.py): extracción de importes, tasas variables de IGV, leyendas/datos SPOT, clasificación de comprobantes vs soportes y detalle de ítems.
+7. [padron.py](src/ocr_fiscal/padron.py) y [storage.py](src/ocr_fiscal/storage.py): consulta SQLite local del Padrón RUC y persistencia de la corrida en `.ocr_fiscal/state.sqlite3`.
+8. [processor.py](src/ocr_fiscal/processor.py), [pdf_organizer.py](src/ocr_fiscal/pdf_organizer.py), [exports.py](src/ocr_fiscal/exports.py) y [benchmark.py](src/ocr_fiscal/benchmark.py): orquestación, cotejo QR, deduplicación, armado de `expediente_pdf/`, generación de `CDP.xlsx` y calibración.
 
-Las partes marcadas con `DEPRECADO` en un comentario no las usa ningún otro código del programa. Se conservan por si alguna vez se retoma ese camino (por ejemplo, el lector de facturas XML), y se pueden borrar sin que cambie el resultado.
+---
 
 ## Contribuir y licencia
 
-Este proyecto es de código abierto bajo la **GNU Affero General Public License v3.0** (ver [LICENSE](LICENSE)). La licencia AGPL exige que, si ofreces una versión modificada como servicio a través de una red, también pongas su código a disposición de quienes lo usan. Las librerías PyMuPDF (AGPL-3.0) y Tesseract (Apache-2.0) tienen sus propias licencias.
+Este proyecto es de código abierto bajo la licencia **GNU Affero General Public License v3.0** (ver [LICENSE](LICENSE)). Las dependencias y herramientas externas conservan sus propias licencias (`PyMuPDF` bajo AGPL-3.0, `Tesseract` bajo Apache-2.0).
 
-Si quieres contribuir con un informe de error o con cambios:
-
-- **No adjuntes comprobantes reales.** Contienen datos de terceros. Describe el caso con el texto mínimo que lo reproduce y sustituye los nombres, los RUC y los importes.
-- Indica la versión de Python, la de Tesseract y el contenido de tu `config.json`.
-- Un cambio en las reglas de lectura debe explicar qué defecto corrige y qué no cambia. Si un valor no se puede leer con evidencia, la respuesta correcta es dejarlo en blanco y señalarlo para revisión, no suponerlo.
+Si deseas reportar un caso o proponer mejoras:
+- **Nunca adjuntes comprobantes reales** ni archivos con datos de terceros; describe el caso sustituyendo razones sociales, RUC e importes por datos ficticios.
+- Indica tu versión de Python, de Tesseract y el contenido relevante de `config.json`.
+- Todo ajuste en reglas de extracción debe respetar la regla base del proyecto: si un dato no puede comprobarse en el documento, queda en blanco y pasa a `revision`, sin suposiciones.

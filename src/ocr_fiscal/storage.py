@@ -730,6 +730,9 @@ class StateStore:
             elif key == "secondary_review_fields":
                 assignments.append("secondary_review_fields_json = ?")
                 params.append(json.dumps(list(val or []), ensure_ascii=False))
+            elif key == "derived_checks":
+                assignments.append("derived_checks_json = ?")
+                params.append(json.dumps(list(val or []), ensure_ascii=False))
         if not assignments:
             return
         params.append(int(document_id))
