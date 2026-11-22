@@ -26,14 +26,9 @@ DEFAULT_DOCUMENT_TYPES: dict[str, str] = {
 }
 
 # Estados posibles al decidir si un bloque de página es un comprobante de pago (CDP).
-# Algunos nombres están repetidos (DETECTED y CDP_DETECTED, por ejemplo) porque el código antiguo
-# usaba unos y el nuevo otros; valen exactamente lo mismo.
 DETECTED = "cdp_detectado"
-CDP_DETECTED = "cdp_detectado"
 NOT_RECEIPT = "no_cdp"
-NO_CDP = "no_cdp"
 AMBIGUOUS = "indeterminado"
-UNDETERMINED = "indeterminado"
 READ_ERROR = "error_de_lectura"
 
 # Estados de la identidad de un CDP ya detectado: ¿tenemos completos el emisor, el tipo, la serie y el correlativo?

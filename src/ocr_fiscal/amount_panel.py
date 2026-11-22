@@ -102,9 +102,10 @@ def _read_region(
     config: AppConfig, engine: TesseractOCREngine,
 ) -> list[LayoutLine]:
     # Paso 1: abrir el PDF, desde memoria si viene de dentro de un ZIP o desde el disco si no.
+    raw_bytes = unit.read_bytes()
     document = (
-        pymupdf.open(stream=unit.content_bytes, filetype="pdf")
-        if unit.content_bytes is not None else pymupdf.open(unit.disk_path)
+        pymupdf.open(stream=raw_bytes, filetype="pdf")
+        if raw_bytes is not None else pymupdf.open(unit.disk_path)
     )
     with document:
         original = document[page.page_number - 1]

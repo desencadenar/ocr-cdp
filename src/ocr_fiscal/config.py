@@ -59,12 +59,22 @@ class AppConfig:
     explicit_render_dpi_metadata: bool = True
     # Base local del padrón RUC (SQLite) para contrastar la razón social. None = sin padrón.
     padron_db_path: Path | None = None
-    # Antigüedad máxima del padrón, en días. None = sin límite.
+    # Archivo local de la consulta RUC múltiple de SUNAT (salida de consulta_ruc.py) con el CIIU de los emisores.
+    # Sirve para decidir la tasa especial de restaurantes y hoteles. None = sin consulta.
+    consulta_ruc_path: Path | None = None
+    # Antigüedad máxima del padrón, en días. None = sin límite (valor por defecto, a pedido del usuario: el padrón
+    # de consulta_ruc_masivo se usa aunque sea antiguo). La fecha de corte se informa en la hoja resumen.
     padron_max_age_days: int | None = None
     # Unifica Notas de Crédito/Débito (07/08) dentro de la misma carpeta del proveedor en 01_cdp_por_proveedor.
     unify_notes_by_provider: bool = True
     # Tolerancia máxima de redondeo (en moneda del documento) para aceptar el cuadre de importes como cuadre con redondeo.
     rounding_tolerance: float = 0.02
+    # Conservar .ocr_fiscal/state.sqlite3 al terminar. Guarda fragmentos de los documentos (evidencia, RUC,
+    # razones sociales, importes, descripciones); con False se borra después de escribir el Excel.
+    keep_run_state: bool = True
+    # Guardar la lectura completa de cada documento (texto, líneas con coordenadas y confianza) en
+    # .ocr_fiscal/lecturas.sqlite3, para que el comando redetectar repita la detección sin OCR.
+    keep_full_reading: bool = True
 
 
 # Lee el archivo de ajustes, lo valida y devuelve un AppConfig.
@@ -94,8 +104,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         "exportar_pdf_ordenado": defaults.export_pdf_folders,
         "padron_ruc": None,
         "padron_dias_maximos": defaults.padron_max_age_days,
+        "consulta_ruc": None,
         "unificar_notas_en_proveedor": defaults.unify_notes_by_provider,
         "tolerancia_redondeo": defaults.rounding_tolerance,
+        "conservar_estado_corrida": defaults.keep_run_state,
+        "guardar_lectura_completa": defaults.keep_full_reading,
     }
     # Paso 3: rechazar nombres de ajuste desconocidos (por ejemplo, un error de tipeo) antes de seguir.
     unknown = sorted(raw.keys() - settings.keys())
@@ -141,10 +154,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         raise ValueError("unificar_notas_en_proveedor debe ser true o false.")
     if padron is not None and (not isinstance(padron, str) or not padron.strip()):
         raise ValueError("padron_ruc debe ser null o una ruta escrita entre comillas.")
+    consulta = settings["consulta_ruc"]
+    if consulta is not None and (not isinstance(consulta, str) or not consulta.strip()):
+        raise ValueError("consulta_ruc debe ser null o una ruta escrita entre comillas.")
     if padron_days is not None and (type(padron_days) is not int or padron_days < 1):
         raise ValueError("padron_dias_maximos debe ser null o un entero mayor o igual a 1.")
     if type(rounding_tol) not in {int, float} or rounding_tol < 0 or rounding_tol > 0.5:
         raise ValueError("tolerancia_redondeo debe ser un número entre 0 y 0.5.")
+    if type(settings["conservar_estado_corrida"]) is not bool:
+        raise ValueError("conservar_estado_corrida debe ser true o false.")
+    if type(settings["guardar_lectura_completa"]) is not bool:
+        raise ValueError("guardar_lectura_completa debe ser true o false.")
 
     # Una ruta relativa se interpreta desde el archivo de ajustes que la declara.
     directory = config_path.resolve().parent
@@ -165,6 +185,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         export_pdf_folders=export_pdfs,
         padron_db_path=directory / Path(padron).expanduser() if padron is not None else None,
         padron_max_age_days=padron_days,
+        consulta_ruc_path=directory / Path(consulta).expanduser() if consulta is not None else None,
         unify_notes_by_provider=unify_notes,
         rounding_tolerance=float(rounding_tol),
+        keep_run_state=settings["conservar_estado_corrida"],
+        keep_full_reading=settings["guardar_lectura_completa"],
     )

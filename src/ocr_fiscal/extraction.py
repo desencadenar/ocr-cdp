@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
-from .amounts import AMOUNT_FIELDS, amount_mentions, evaluate_igv_rate, pair_columnar_amounts, reconcile_amounts
+from .amounts import AMOUNT_COLUMNS, AMOUNT_FIELDS, amount_mentions, evaluate_igv_rate, pair_columnar_amounts, reconcile_amounts
 from .models import (
     AMBIGUOUS,
     DEFAULT_DOCUMENT_TYPES,
@@ -38,7 +39,7 @@ _RUC_TOKEN = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{11})(?![A-Z0-9])", re.IGNORECAS
 # (con al menos un dígito), o son 3 o 4 dígitos cuando el contexto es claramente el de un comprobante.
 # Acepta también formas como «FO02 N° - 00000123» y DUA/DAM («118-2025-10-001234»).
 _SERIAL_PAIR = re.compile(
-    r"(?<![A-Z0-9-])(?P<series>[FBESTLRPV][A-Z0-9]{2,7}|[0-9]{3,4})\s*(?:N(?:RO|°|º|\.)\s*)?[-–]\s*(?P<number>[0-9]{1,20})(?![A-Z0-9-])",
+    r"(?<![A-Z0-9-])(?P<series>[FBESTLRPV][A-Z0-9]{2,7}|[0-9]{3,4})\s*(?:N(?:RO|°|º|\.)\s*)?[-–]\s*(?:N(?:RO|°|º|\.)\s*)?(?P<number>[0-9]{1,20})(?![A-Z0-9-])",
     re.IGNORECASE,
 )
 _DUA_PAIR = re.compile(
@@ -61,7 +62,7 @@ _DATE = re.compile(
 # fecha de emisión.
 _LABEL_NOISE = r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{0,8}"
 _DATE_LABEL = re.compile(
-    r"\b(?:FECHA(?:\s+DE)?(?:\s+EMISI[ÓO]N)?|F\.?\s*EMISI[ÓO]N)" + _LABEL_NOISE
+    r"\b(?:FECHA(?:\s+DE)?(?:\s+EMISI[ÓO]N)?|F\.?\s*EMISI[ÓO]N|ISSUE\s+DATE|DATE\s+OF\s+ISSUE)" + _LABEL_NOISE
     + r"([0-9]{1,2}[/.-][0-9]{1,2}[/.-][0-9]{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})",
     re.IGNORECASE,
 )
@@ -97,7 +98,7 @@ _TYPE_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("07", "Nota de crédito", re.compile(r"\bNOTA\s+(?:DE\s+)?CR[EÉ]DITO\b", re.IGNORECASE)),
     ("08", "Nota de débito", re.compile(r"\bNOTA\s+(?:DE\s+)?D[EÉ]BITO\b", re.IGNORECASE)),
     ("03", "Boleta de venta", re.compile(r"\bBOLETA(?:\s+DE\s+VENTA)?\b(?!\s+DE\s+(?!VENTA\b))", re.IGNORECASE)),
-    ("01", "Factura", re.compile(r"\bFACTURA\b(?!\s+(?:PROFORMA|NEGOCIABLE)\b)", re.IGNORECASE)),
+    ("01", "Factura", re.compile(r"\bFACTURA\b(?!\s+(?:PROFORMA|NEGOCIABLE)\b)|\bELECTRONIC\s+INVOICE\b", re.IGNORECASE)),
     ("02", "Recibo por honorarios", re.compile(r"\bRECIBO\s+(?:ELECTR[ÓO]NICO\s+)?POR\s+HONORARIOS\b", re.IGNORECASE)),
     ("04", "Liquidación de compra", re.compile(r"\bLIQUIDACI[ÓO]N\s+DE\s+COMPRA\b", re.IGNORECASE)),
     (
@@ -244,10 +245,74 @@ _SUPPORT_REF_SERIAL_LINE = re.compile(
 # Palabras que marcan quién es quién: emisor, receptor y terceros (transportistas, bancos, garantes...).
 # Se usan para asignar el rol de cada RUC.
 _ISSUER_ROLE = re.compile(r"\b(?:EMISORA?|ISSUING\s+AIRLINE|PROVEEDOR|VENDEDOR|EXPEDIDOR)\b", re.IGNORECASE)
+# «Señor(es)», «Señores», «Señore(s)» (variante frecuente en facturas digitales).
 _RECIPIENT_ROLE = re.compile(
-    r"\b(?:ADQUIRENTE|ADQUIRIENTE|CLIENTE|RECEPTOR|USUARIO|SE[ÑN]OR(?:\(?E?S\)?)?|SEFIOR(?:\(?E?S\)?)?|DESTINATARIO|COMPRADOR|RECIB[ÍI]\s+DE|TITULAR|FOID|D\.?\s*IDENTIDAD)\b",
+    r"\b(?:ADQUIRENTE|ADQUIRIENTE|CLIENTE|CUSTOMER|RECEPTOR|USUARIO|SE[ÑN]OR(?:E?\(?E?S\)?)?|SEFIOR(?:E?\(?E?S\)?)?|DESTINATARIO|COMPRADOR|RECIB[ÍI]\s+DE|TITULAR|FOID|D\.?\s*IDENTIDAD)\b",
     re.IGNORECASE,
 )
+# Rótulo del cliente por aproximación. La expresión de arriba fija grafías; el OCR y
+# los diseños producen otras («SEÑ0RES», «Clíente», «Señore s», «CLLIENTE»). Se normaliza la primera palabra de la
+# línea (mayúsculas, sin tildes ni signos, dígitos confundibles por letras, una letra suelta unida a la palabra) y se
+# compara con un vocabulario corto con distancia de edición: 1 hasta 7 letras, 2 desde 8. Solo cuenta al comienzo
+# de la línea, que es donde va un rótulo.
+_RECIPIENT_VOCAB = {
+    "SENOR": "SEÑOR(ES)", "SENORES": "SEÑOR(ES)", "CLIENTE": "CLIENTE", "ADQUIRENTE": "ADQUIRENTE",
+    "ADQUIRIENTE": "ADQUIRENTE", "RECEPTOR": "RECEPTOR", "DESTINATARIO": "DESTINATARIO", "USUARIO": "USUARIO",
+    "COMPRADOR": "COMPRADOR",
+}
+# Palabras reales cercanas a alguna del vocabulario que no son rótulos del cliente.
+_RECIPIENT_VOCAB_STOP = frozenset({"CLIENTES", "USUARIOS", "SENAL", "SENORA", "SENORITA", "RECEPCION", "RECEPTORA"})
+_OCR_DIGIT_AS_LETTER = str.maketrans({"0": "O", "1": "I", "5": "S", "8": "B"})
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def fuzzy_recipient_label(text: str) -> tuple[str, str] | None:
+    """Si la línea empieza con un rótulo de cliente, aunque esté mal leído, devuelve (rótulo canónico, palabra leída)."""
+    raw = unicodedata.normalize("NFKD", text or "")
+    raw = "".join(ch for ch in raw if not unicodedata.combining(ch)).upper()
+    raw = re.sub(r"[()\[\].,;'\"*]", "", raw)
+    tokens = re.findall(r"[A-Z0-9]+", raw)
+    if not tokens:
+        return None
+    word = tokens[0]
+    # «Señore s» o «Se ñores»: una o dos letras sueltas detrás se unen a la palabra.
+    if len(tokens) > 1 and len(tokens[1]) <= 2 and tokens[1].isalpha():
+        word += tokens[1]
+    if not re.search(r"[A-Z]", word):
+        return None
+    word = word.translate(_OCR_DIGIT_AS_LETTER)
+    if len(word) < 5 or not word.isalpha() or word in _RECIPIENT_VOCAB_STOP:
+        return None
+    best: tuple[int, str] | None = None
+    for candidate, canon in _RECIPIENT_VOCAB.items():
+        limit = 1 if len(candidate) <= 7 else 2
+        if abs(len(candidate) - len(word)) > limit:
+            continue
+        dist = _edit_distance(word, candidate)
+        if dist <= limit and (best is None or dist < best[0]):
+            best = (dist, canon)
+    return (best[1], word) if best else None
+
+
+def _recipient_label(text: str) -> tuple[bool, str | None]:
+    """¿Hay rótulo de cliente? Devuelve (sí o no, motivo cuando solo se reconoció por aproximación)."""
+    if _RECIPIENT_ROLE.search(text or ""):
+        return True, None
+    hit = fuzzy_recipient_label(text)
+    if hit:
+        return True, f'rótulo aproximado "{hit[1]}" ≈ {hit[0]}'
+    return False, None
+
+
 _THIRD_PARTY_ROLE = re.compile(
     r"\b(?:TRANSPORTISTA|CONDUCTOR|TERCERO|GARANTE|CESIONARIO|FACTORING|BANCO\s+PAGADOR|AGENTE\s+DE\s+ADUANA)\b",
     re.IGNORECASE,
@@ -308,6 +373,13 @@ _READ_ERRORS = {"ocr_error", "ocr_unavailable", "quality_limit", "read_error", "
 # Minúsculas y espacios simples, para comparar líneas sin que importen las mayúsculas ni los espacios.
 def _norm(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip().casefold()
+
+
+_AMOUNT_LABELS = {field: label for label, field in AMOUNT_COLUMNS}
+# Importes cuyo separador no se puede interpretar: un único punto seguido de exactamente tres dígitos
+# («10.000», «1.800») o una coma seguida de un solo dígito («100,5»).
+_AMBIGUOUS_AMOUNT_RE = re.compile(r"[+\-−]?\s*(?:\d{1,3}\.\d{3}|\d+,\d)")
+AMBIGUOUS_AMOUNT_STATUS = "formato_ambiguo"
 
 
 # Pasa un importe tal como se leyó («1,234.50», «34 926,71», «164.231,59») a un número con punto decimal y dos decimales.
@@ -615,6 +687,34 @@ def _detect_non_receipt_type(lines: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+# Soportes cuyo descarte se frena si el bloque trae la estructura completa de un comprobante.
+# La consulta de validez SUNAT, el asiento SAP y el anexo de factura negociable no entran: sus frases son
+# propias de esos reportes y suelen repetir RUC, serie e importes del comprobante que describen.
+_GUARDED_SUPPORT_TYPES = frozenset({
+    "constancia_detraccion_spot",
+    "guia_de_remision",
+    "estado_de_cuenta_bancario",
+    "hoja_entrada_servicios_hes",
+    "orden_de_compra_pedido",
+})
+# Serie-correlativo con forma de comprobante: serie alfanumérica de 4 caracteres que empieza con letra
+# (F001, B001, E001, S001...) o serie numérica de 3-4 dígitos (001-0001234). No acepta números de cuenta
+# con más segmentos («191-1234567-0-12»).
+_RECEIPT_SERIAL_SHAPE_RE = re.compile(r"(?<![\w-])(?:[A-Z][A-Z0-9]{3}|\d{3,4})\s*[-–]\s*\d{3,10}(?![\w-])", re.IGNORECASE)
+_RUC_CANDIDATE_RE = re.compile(r"(?<!\d)(?:10|15|16|17|20)\d{9}(?!\d)")
+
+
+def _has_receipt_structure(lines: list[str]) -> bool:
+    """¿El bloque tiene RUC con dígito válido, serie-correlativo, IGV y total (o subtotal) rotulados?"""
+    joined = "\n".join(lines)
+    if not any(validate_ruc(m.group(0)).checksum_valid for m in _RUC_CANDIDATE_RE.finditer(joined)):
+        return False
+    if not _RECEIPT_SERIAL_SHAPE_RE.search(joined):
+        return False
+    fields = _amount_field_names(lines)
+    return "igv" in fields and bool(fields & {"total", "subtotal", "total_a_pagar", "valor_venta"})
+
+
 _SENTENCE_PREFIX_RE = re.compile(r"^(?:POR|SEG[ÚU]N|PARA|EN|DE|CON|MEDIANTE|DEL)\b", re.IGNORECASE)
 _RIGHT_COLUMN_HEADER_SUFFIX_RE = re.compile(
     r"^(?:\s*(?:ELECTR[ÓO]NIC[AO]|ELECTR?\.?))?\s{2,}(?:FECHA|R\.?U\.?C|SERIE|N(?:RO|°|º)|MONEDA|SE[ÑN]OR|CLIENTE|ADQUIRENTE|P[ÁA]G|CONDICI[ÓO]N|FORMA)\b",
@@ -707,6 +807,27 @@ _IATA_TICKET_RE = re.compile(r"(?<!\d)([0-9]{3})[- ]?([0-9]{10})(?!\d)")
 
 # Busca series y correlativos en las líneas. Devuelve dos listas: las identidades propias del comprobante
 # y los comprobantes a los que hace referencia (los que modifica una nota, por ejemplo).
+# Lo que puede ir justo antes de un par «NNN-NNNN» que no es serie-correlativo:
+# el número de una norma («R.S. 037-2002», «Resolución de Superintendencia N° 037-2002», «Ley», «Decreto»)
+# o un teléfono («Telf.», «Tlf», «Central telefónica», código de área entre paréntesis «(511)» o «01»).
+_NON_RECEIPT_NUMERIC_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\bR\.?\s*S\.?|\bRESOLUCI[ÓO]N(?:\s+DE\s+[A-ZÁÉÍÓÚ]+)*|\bLEY|\bDECRETO(?:\s+[A-ZÁÉÍÓÚ]+)*|\bD\.?\s*(?:S|LEG|LEGISLATIVO|U)\.?"
+    r")\s*(?:N(?:RO|[°º]|\.)?\s*\.?\s*)?[:#]?\s*$"
+    r"|\b(?:TEL[ÉE]?FS?|TLFS?|TELF(?:ONO)?S?|TEL[ÉE]FONOS?|TELEF[ÓO]NIC[AO]|CENTRAL|FONO|WHATSAPP)\b[^0-9]{0,6}(?:\(?\s*0?\d{1,3}\s*\)?\s*)?$"
+    r"|\(\s*0?\d{1,3}\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _numeric_pair_is_not_a_receipt(prefix: str, suffix: str) -> bool:
+    """¿Un par con serie numérica es en realidad una norma o un teléfono, por lo que lo rodea?"""
+    if _NON_RECEIPT_NUMERIC_PREFIX_RE.search(prefix):
+        return True
+    # «037-2002/SUNAT», «055-99/EF»: la barra tras el número es propia de la numeración de normas.
+    return bool(re.match(r"\s*/\s*[A-Z]", suffix, re.IGNORECASE))
+
+
 def _serial_signals(lines: list[str]) -> tuple[list[tuple[str, str, int, tuple[int, ...]]], list[tuple[str, int]]]:
     """Devuelve (identidades propias del comprobante, series-número referenciados)."""
     found: list[tuple[str, str, int, tuple[int, ...]]] = []
@@ -754,6 +875,8 @@ def _serial_signals(lines: list[str]) -> tuple[list[tuple[str, str, int, tuple[i
                 continue
             prefix = line[: match.start()]
             if re.search(r"\b(?:TEL(?:[ÉE]F(?:ONO)?|\.)?|FAX|ANEXO|CEL(?:ULAR)?)\s*[:.#-]?\s*(?:\([0-9]+\)\s*)?$", prefix, re.IGNORECASE):
+                continue
+            if match.group("series").isdigit() and _numeric_pair_is_not_a_receipt(prefix, line[match.end():]):
                 continue
             series = match.group("series").upper()
             number = match.group("number")
@@ -849,6 +972,11 @@ def _support_block_stands_alone(segment: Sequence[str], title_index: int) -> boo
     return bool(body) and _detect_non_receipt_type(body)[0] is not None
 
 
+def _amount_field_names(lines: Sequence[str]) -> set[str]:
+    """Campos de importe rotulados en las líneas («igv», «total», ...)."""
+    return {field for line in lines for field, *_ in amount_mentions(line)}
+
+
 def _split_block_ranges(lines: list[str], catalog: Mapping[str, str]) -> list[tuple[int, int]]:
     """Devuelve los rangos (inicio, fin) que segmentan una página en bloques."""
     hits = _type_hits(lines, catalog)
@@ -884,10 +1012,17 @@ def _split_block_ranges(lines: list[str], catalog: Mapping[str, str]) -> list[tu
             split_at = after_support[0]
             rec_segment = lines[:split_at]
             rec_types, rec_serials = _block_signature(rec_segment, catalog)
+            # Una línea «ORDEN DE COMPRA 4500012345» dentro de la factura no la parte
+            # si así la factura se queda sin total y el IGV y el total quedan del lado del soporte.
+            takes_receipt_amounts = (
+                not (_amount_field_names(rec_segment) & {"total", "total_a_pagar"})
+                and {"igv", "total"} <= _amount_field_names(lines[split_at:])
+            )
             if (
                 rec_types
                 and (rec_serials or _ruc_mentions(rec_segment))
                 and _support_block_stands_alone(lines[split_at:], 0)
+                and not takes_receipt_amounts
             ):
                 return [(0, split_at), (split_at, len(lines))]
 
@@ -943,7 +1078,7 @@ def _split_blocks_with_layout(
 def _client_section_start(lines: list[str]) -> int | None:
     """Devuelve el índice de la primera línea que abre el bloque del cliente o receptor."""
     for idx, line in enumerate(lines):
-        if _RECIPIENT_ROLE.search(line):
+        if _recipient_label(line)[0]:
             return idx
         if re.search(r"^\s*RAZ[ÓO]N\s+SOCIAL\s*:", line, re.IGNORECASE) and idx >= 4:
             return idx
@@ -963,7 +1098,7 @@ def _role_for_ruc(
     prev_line = lines[index - 1] if index > 0 else ""
 
     # 1. Rol explícito de tercero (transportista, banco, garante, factoring) sin sobrescribir etiquetas explícitas de cliente/emisor
-    has_explicit_party = bool(_ISSUER_ROLE.search(line) or _RECIPIENT_ROLE.search(line))
+    has_explicit_party = bool(_ISSUER_ROLE.search(line) or _recipient_label(line)[0])
     if (
         (not has_explicit_party and (_THIRD_PARTY_ROLE.search(line) or _THIRD_PARTY_ROLE.search(prev_line)))
         or re.search(
@@ -985,11 +1120,14 @@ def _role_for_ruc(
     ]
     # Una etiqueta de cliente/adquirente introduce los datos situados en esa misma línea o debajo de ella,
     # nunca un RUC que apareció líneas más arriba en la cabecera del emisor.
-    recipient_preceding = [
-        index - other
-        for other in range(max(0, index - 2), index + 1)
-        if _RECIPIENT_ROLE.search(lines[other])
-    ]
+    recipient_preceding: list[int] = []
+    fuzzy_note: str | None = None
+    for other in range(index, max(0, index - 2) - 1, -1):
+        found, note = _recipient_label(lines[other])
+        if found:
+            if not recipient_preceding:
+                fuzzy_note = note  # El motivo es el del rótulo más cercano.
+            recipient_preceding.append(index - other)
     issuer_distance = min(issuer_preceding, default=99)
     recipient_distance = min(recipient_preceding, default=99)
 
@@ -997,7 +1135,8 @@ def _role_for_ruc(
         if issuer_distance < recipient_distance:
             return "emitter_ruc", "Etiqueta explícita de emisor/proveedor junto al RUC"
         if recipient_distance <= 2:
-            return "recipient_ruc", "Etiqueta explícita de cliente/adquirente/señor(es) en la línea o líneas previas"
+            comment = "Etiqueta explícita de cliente/adquirente/señor(es) en la línea o líneas previas"
+            return "recipient_ruc", f"{comment}; {fuzzy_note}" if fuzzy_note else comment
 
     # 3. Por su posición respecto del bloque del cliente: dentro de él es el receptor; en la cabecera, antes de él, el emisor.
     client_start = _client_section_start(lines)
@@ -1059,7 +1198,10 @@ def _recipient_rucs_in_columns(layout: Sequence[LayoutLine]) -> dict[tuple[int, 
         anchors = [
             index for index, anchor in enumerate(layout)
             if anchor.source == label.source and anchor.bbox
-            and re.match(r"^\s*(?:SE[ÑN]OR|SEFIOR|CLIENTE|ADQUIRENTE|RECEPTOR|COMPRADOR|RECIB[ÍI]\s+DE|TITULAR)\b", anchor.text, re.IGNORECASE)
+            and (
+                re.match(r"^\s*(?:SE[ÑN]OR(?:E?\(?E?S\)?)?|SEFIOR|CLIENTE|ADQUIRENTE|RECEPTOR|COMPRADOR|RECIB[ÍI]\s+DE|TITULAR)\b", anchor.text, re.IGNORECASE)
+                or fuzzy_recipient_label(anchor.text) is not None
+            )
             and 0 < top - anchor.bbox[1] <= 4 * height
             and abs(left - anchor.bbox[0]) <= 2 * height
         ]
@@ -1336,7 +1478,35 @@ def _extract_serials(
             )
 
     complete = [(series, number, index, indexes) for series, number, index, indexes in signals if series and number]
+    # Una serie numérica de puros ceros («000-4594253», de una cuenta bancaria) no es serie de comprobante.
+    complete = [item for item in complete if not re.fullmatch(r"0+", item[0])]
     unique_pairs = list(dict.fromkeys((series.upper(), number) for series, number, _, _ in complete))
+    # Recuadro fiscal (validación del usuario, 2026-11-21): si de varias identidades exactamente una está sola en
+    # su línea y a tres líneas o menos del título del comprobante, es la del recuadro; las demás vienen de
+    # teléfonos, cuentas o descripciones de ítems. Con dos o más así, el conflicto sigue y va a revisión.
+    if len(unique_pairs) > 1:
+        title_idx = [i for i, line in enumerate(lines) if any(p.search(line) for _, _, p in _TYPE_PATTERNS)]
+
+        def _in_box(item: tuple, window: int = 4) -> bool:
+            series, number, index, _ = item
+            alone = re.fullmatch(
+                rf"\s*(?:N(?:RO|°|º|\.)\s*)?{re.escape(series)}\s*(?:N(?:RO|°|º|\.)\s*)?[-–]\s*(?:N(?:RO|°|º|\.)\s*)?{re.escape(number)}\s*",
+                lines[index], re.IGNORECASE,
+            )
+            return bool(alone) and any(abs(index - t) <= window for t in title_idx)
+
+        boxed = {(s_.upper(), n_) for s_, n_, i_, x_ in complete if _in_box((s_, n_, i_, x_))}
+        # Ningún otro candidato puede estar también solo en su línea cerca del título (hasta 7 líneas).
+        near = {(s_.upper(), n_) for s_, n_, i_, x_ in complete if _in_box((s_, n_, i_, x_), window=7)}
+        if len(boxed) == 1 and near == boxed:
+            chosen = next(iter(boxed))
+            discarded = [f"{s_}-{n_}" for s_, n_ in unique_pairs if (s_, n_) != chosen]
+            result.observations.append(
+                f"serie-correlativo del recuadro fiscal {chosen[0]}-{chosen[1]}; se descartan {', '.join(discarded)} "
+                "(fuera del recuadro: teléfono, cuenta o detalle)"
+            )
+            complete = [item for item in complete if (item[0].upper(), item[1]) == chosen]
+            unique_pairs = [chosen]
     if len(unique_pairs) == 1:
         series, number = unique_pairs[0]
         matching = next(item for item in complete if (item[0].upper(), item[1]) == (series, number))
@@ -1512,15 +1682,28 @@ def _record_amount_field(
     literal = observed.replace("\u00a0", " ")
     if re.fullmatch(r"[+-]?\s*\d{1,3}(?:\.\d{3}){2,}", literal):
         literal = literal.replace(".", "")
-    normalized = _normalize_amount_str(literal)
-    if normalized is None:
-        return
-    existing = getattr(result, field_name)
     ev_indexes = list(indexes) if indexes is not None else [index]
     line_no = layout_lines[index].line_number if layout_lines and index < len(layout_lines) else index + 1
     bbox = _line_bbox(ev_indexes, layout_lines)
     score = _line_confidence(lines, ev_indexes, line_confidences, layout_lines)
     excerpt = _excerpt(lines, ev_indexes, radius=0) if len(ev_indexes) > 1 else lines[index].strip()
+    # \u00ab10.000\u00bb puede ser diez mil (punto de miles) o diez (tres decimales); \u00ab100,5\u00bb puede ser 100.50 o 1 005.
+    # No se elige: el importe queda en blanco y la lectura se anota para revisi\u00f3n.
+    if _AMBIGUOUS_AMOUNT_RE.fullmatch(literal.strip()):
+        _add_field(
+            result, field_name, observed.strip(), None, page_number, excerpt, 0.30, block_number, score,
+            line_number=line_no, bbox=bbox, source=source, field_status=AMBIGUOUS_AMOUNT_STATUS,
+            decision_comment=(
+                f"Formato ambiguo \u00ab{observed.strip()}\u00bb: el separador puede ser de miles o decimal. "
+                "No se da el importe por le\u00eddo."
+            ),
+        )
+        result.observations.append(f"importe de \u00ab{field_name}\u00bb con formato ambiguo: \u00ab{observed.strip()}\u00bb")
+        return
+    normalized = _normalize_amount_str(literal)
+    if normalized is None:
+        return
+    existing = getattr(result, field_name)
     candidates = set(result.candidates.get(field_name, [])) | {normalized}
     if existing is not None:
         candidates.add(existing)
@@ -1680,7 +1863,7 @@ def _extract_other_fields(
 
         if result.issuer_name is None and index <= 5 and (client_start is None or index < client_start):
             tiene_forma_societaria = _LEGAL_ENTITY_SUFFIX.search(line) or _LEGAL_ENTITY_SUFFIX_PLAIN.search(line)
-            if tiene_forma_societaria and not re.search(r"^\s*(?:RAZ[ÓO]N\s+SOCIAL|SE[ÑN]OR(?:\(?E?S\)?)?|CLIENTE|RECIB[ÍI]\s+DE)\b", line, re.IGNORECASE):
+            if tiene_forma_societaria and not re.search(r"^\s*(?:RAZ[ÓO]N\s+SOCIAL|SE[ÑN]OR(?:E?\(?E?S\)?)?|CLIENTE|RECIB[ÍI]\s+DE)\b", line, re.IGNORECASE):
                 cleaned_name = re.sub(r"\bR\.?U\.?C\.?\s*(?:N[°º.]?\s*)?[0-9A-Z]{8,11}.*$", "", line, flags=re.IGNORECASE)
                 cleaned_name = re.sub(r"\b(?:FACTURA|BOLETA|NOTA\s+DE\s+CR[EÉ]DITO|NOTA\s+DE\s+D[EÉ]BITO|RECIBO).*$", "", cleaned_name, flags=re.IGNORECASE).strip(" -:")
                 if len(cleaned_name) >= 5:
@@ -1698,7 +1881,7 @@ def _extract_other_fields(
                 _add_field(result, "issuer_name", cleaned_person, cleaned_person, page_number, line.strip(), 0.86, block_number, score, line_number=line_no, bbox=bbox)
 
         recipient_match = re.search(
-            r"\b(?:SE[ÑN]OR(?:\(?E?S\)?)?|SEFIOR(?:\(?E?S\)?)?|CLIENTE|ADQUIRENTE|ADQUIRIENTE|RECIB[ÍI]\s+DE|TITULAR|NOMBRE\s*/\s*RAZ[ÓO]N\s+SOCIAL|RAZ[ÓO]N\s+SOCIAL)\s*[:#-]\s*(.*)$",
+            r"\b(?:SE[ÑN]OR(?:E?\(?E?S\)?)?|SEFIOR(?:E?\(?E?S\)?)?|CLIENTE|ADQUIRENTE|ADQUIRIENTE|RECIB[ÍI]\s+DE|TITULAR|NOMBRE\s*/\s*RAZ[ÓO]N\s+SOCIAL|RAZ[ÓO]N\s+SOCIAL)\s*[:#-]\s*(.*)$",
             line,
             re.IGNORECASE,
         )
@@ -1720,7 +1903,7 @@ def _extract_other_fields(
                     if result.recipient_name is None:
                         result.recipient_name = val
                         _add_field(result, "recipient_name", val, val, page_number, line.strip(), 0.92, block_number, score, line_number=line_no, bbox=bbox)
-                elif re.search(r"\b(?:SE[ÑN]OR(?:\(?E?S\)?)?|SEFIOR(?:\(?E?S\)?)?|CLIENTE|ADQUIRENTE|RECIB[ÍI]\s+DE|TITULAR)\b", line, re.IGNORECASE) and result.recipient_name is None:
+                elif re.search(r"\b(?:SE[ÑN]OR(?:E?\(?E?S\)?)?|SEFIOR(?:E?\(?E?S\)?)?|CLIENTE|ADQUIRENTE|RECIB[ÍI]\s+DE|TITULAR)\b", line, re.IGNORECASE) and result.recipient_name is None:
                     result.recipient_name = val
                     _add_field(result, "recipient_name", val, val, page_number, line.strip(), 0.90, block_number, score, line_number=line_no, bbox=bbox)
                 elif result.issuer_name is None and client_start is None:
@@ -1969,7 +2152,7 @@ _ITEM_ROW_TABULAR = re.compile(
 # Forma 2 (muy común en SUNAT/Nubefact/Odoo/Concar): cantidad, unidad, [código opcional], descripción, unitario y total.
 _ITEM_ROW_QTY_FIRST = re.compile(
     rf"^\s*(?P<qty>[0-9][0-9,.]*)\s+(?P<unit>{_UNIT_TOKENS})\.?\s+"
-    r"(?:(?P<code>[A-Z0-9._-]{2,15})\s+)?(?P<desc>[A-Za-zÁÉÍÓÚáéíóúÑñ].+?)\s+"
+    r"(?:(?P<code>(?=[A-Z._&-]*[0-9])[A-Z0-9._&-]{2,15})\s+)?(?P<desc>[A-Za-zÁÉÍÓÚáéíóúÑñ].+?)\s+"
     r"(?P<uprice>[0-9][0-9,.]*[.,][0-9]{2,4})\s+(?:(?P<dscto>[0-9][0-9,.]*[.,][0-9]{2,4})\s+)?(?P<total>[0-9][0-9,.]*[.,][0-9]{2,4})\s*$",
     re.IGNORECASE,
 )
@@ -1983,6 +2166,26 @@ _ITEM_ROW_NO_UNIT = re.compile(
 _ITEM_ROW_ELECTRO = re.compile(
     r"^\s*(?P<desc>[A-Za-zÁÉÍÓÚáéíóúÑñ][A-Za-z0-9ÁÉÍÓÚáéíóúÑñ\s()./,-]{4,}?)\s+"
     r"(?P<total>(?:[0-9]{1,3}(?:[\s.,][0-9]{3})+|[0-9]{1,7})[.,][0-9]{2})\s*$"
+)
+
+# Forma «descripción, cantidad, unidad, precio por unidad e importe» con la unidad en el precio («63 216,156 MWh
+# 8,600 S//MWh 543 658,94»): la cantidad y el precio no deben quedar dentro de la descripción.
+_ITEM_ROW_PER_UNIT = re.compile(
+    r"^\s*(?P<desc>[A-Za-zÁÉÍÓÚáéíóúÑñ].{4,}?)\s+"
+    r"(?P<qty>\d{1,3}(?:[ .]\d{3})+(?:,\d{1,4})?|\d+(?:[.,]\d{1,4})?)\s+"
+    r"(?P<unit>MWH|KWH|MW|KW|M3|GAL|KG|TON|LTR|LT)\s+"
+    r"(?P<uprice>\d[\d.,]*)(?:\s+(?:S/|US\$|\$)/*[A-Z0-9]*)?\s+"
+    r"(?P<total>(?:\d{1,3}(?:[\s.,]\d{3})+|\d{1,7})[.,]\d{2})\s*$",
+    re.IGNORECASE,
+)
+
+# Forma «cantidad, código o guion, descripción, unidad, precio unitario y valor de venta»
+# («1 - Servicio Oficina Privada N°716 - Febrero NIU 1,274.40 1,080.00»; validación del usuario, 2026-11-21).
+_ITEM_ROW_QTY_DESC_UNIT = re.compile(
+    r"^\s*(?P<qty>\d{1,4}(?:[.,]\d{1,3})?)\s+(?:[-–]|(?P<code>(?=[A-Z._&-]*\d)[A-Z0-9._&-]{2,15}))\s+"
+    r"(?P<desc>[A-Za-zÁÉÍÓÚáéíóúÑñ].+?)\s+(?P<unit>NIU|ZZ|UND|UNID|UN|GLB|KGM?|KWH|KW|MWH|TON|LTR|LT|GAL|M3|M2|MT|PZA)\.?\s+"
+    r"(?P<uprice>\d[\d,.]*[.,]\d{2,4})\s+(?P<total>\d[\d,.]*[.,]\d{2})\s*$",
+    re.IGNORECASE,
 )
 
 # Cómo reconocer el encabezado de la tabla de detalle y dónde termina (subtotal, total, IGV...).
@@ -2059,10 +2262,37 @@ def _append_line_item(
     return item
 
 
+# Palabras de cabecera de tabla. Una línea hecha solo de ellas es la segunda fila de la cabecera («UNITARIO VENTA»),
+# no una descripción.
+_TABLE_HEADER_WORDS = frozenset({
+    "PRECIO", "VALOR", "DE", "UNITARIO", "UNIT", "VENTA", "CANTIDAD", "CANT", "IMPORTE", "UNIDAD", "MEDIDA", "CODIGO",
+    "COD", "DESCRIPCION", "TOTAL", "ITEM", "UM", "U", "M", "P", "V", "PU", "VU", "DSCTO", "DESCUENTO", "DSCTOS", "IGV",
+})
+# Pie del comprobante que no continúa un ítem: vencimiento e importe en letras.
+_FOOTER_TEXT_RE = re.compile(
+    r"\bFECHA\s+DE\s+(?:VENCIMIENTO|VCTO)\b|\bCON\s+\d{2}\s*/\s*100\b|\b\d{2}\s*/\s*100\s+(?:SOLES|D[OÓ]LARES|NUEVOS)\b|^SON\s*:",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_text(text: str) -> bool:
+    """Al menos dos palabras y ninguna de más de 25 letras: descarta líneas ilegibles del OCR
+    («soegeeewnwessoresssoosesesococessoceccce»)."""
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]{2,}", text)
+    return len(words) >= 2 and max(len(w) for w in words) <= 25
+
+
+def _is_table_header_only(text: str) -> bool:
+    words = re.findall(r"[A-Z]+", unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().upper())
+    return bool(words) and all(w in _TABLE_HEADER_WORDS for w in words)
+
+
 def _is_descriptive_continuation_line(text: str) -> bool:
     """Detecta renglones descriptivos dentro de la tabla que continúan un ítem o glosa sin ser cifras sueltas."""
     s = text.strip(" .|-")
     if len(s) < 3:
+        return False
+    if _is_table_header_only(s) or _FOOTER_TEXT_RE.search(s):
         return False
     if _DETAIL_HEADER.search(s) and _DETAIL_COLUMN.search(s):
         return False
@@ -2080,6 +2310,88 @@ _ROW_WRAP_START_RE = re.compile(
 )
 
 
+# Unidades que no son palabras comunes: «4 NIU …» abre una fila de la forma 2; «0001 SERVICIO …» no (SERVICIO, MES o
+# DÍA también son palabras de la descripción).
+_STRONG_UNIT_TOKENS = r"NIU|ZZ|UND|UNID(?:AD(?:ES)?)?|UN|GLB|KGM?|KWH|KW|MWH|TON|LTR|LT|GAL|M3|M2|MT|PZA|CJ|PAQ?"
+
+
+_WEAK_UNIT_RE = re.compile(r"^(?:SERV(?:ICIO)?|SER|MES(?:ES)?|DIA(?:S)?|HOR(?:AS?)?)$", re.IGNORECASE)
+_DESC_CONNECTOR_RE = re.compile(r"^(?:DE|DEL|POR|EN|PARA|A|Y|CON)\b", re.IGNORECASE)
+
+
+def _unit_and_desc(unit: str, desc: str) -> tuple[str | None, str]:
+    """«1.00 SERVICIO DE ALMACENAJE …»: SERVICIO es la primera palabra de la descripción, no la unidad
+    (validación del usuario, 2026-11-21)."""
+    if _WEAK_UNIT_RE.match(unit or "") and _DESC_CONNECTOR_RE.match(desc or ""):
+        return None, f"{unit} {desc}"
+    return (unit or "").upper() or None, desc
+
+
+def _starts_with_qty_and_unit(text: str) -> bool:
+    """¿La fila empieza con «cantidad unidad» y encaja en la forma 2 (cantidad, unidad, código, descripción, …)?"""
+    return bool(re.match(rf"^\s*[0-9][0-9,.]*\s+(?:{_STRONG_UNIT_TOKENS})\.?\s", text, re.IGNORECASE)
+                and _ITEM_ROW_QTY_FIRST.match(text))
+
+
+_CELL_AMOUNTS_RE = re.compile(r"^(?:S/|US\$|\$|PEN|USD)?\s*[0-9][0-9.,]*(?:\s+[0-9][0-9.,]*)*$", re.IGNORECASE)
+
+
+def _aligned(lines: Sequence[str], layout_lines: Sequence[LayoutLine] | None) -> Sequence[LayoutLine] | None:
+    if layout_lines and len(layout_lines) == len(lines) and all(
+        item.text.strip() == line.strip() for item, line in zip(layout_lines, lines)
+    ):
+        return layout_lines
+    return None
+
+
+def _merge_row_cells(lines: list[str], layout_lines: Sequence[LayoutLine] | None) -> list[str]:
+    """Une a cada línea las celdas de cifras que le siguen en la misma fila, a su derecha.
+
+    En los PDF con texto, cada celda de una fila de ítem suele llegar como línea aparte («… 313.560 370.001» y luego
+    «1,110.00» a la misma altura). Sin unirlas, el importe de la línea se confunde con el precio unitario. Las celdas
+    unidas quedan vacías para conservar los índices de línea.
+    """
+    layout = _aligned(lines, layout_lines)
+    if layout is None:
+        return lines
+    merged = list(lines)
+    i = 0
+    while i < len(merged):
+        box = layout[i].bbox
+        if box is None or not merged[i].strip():
+            i += 1
+            continue
+        j = i + 1
+        right = box[2]
+        height = max(1.0, box[3] - box[1])
+        cy = (box[1] + box[3]) / 2
+        while j < len(merged):
+            nb = layout[j].bbox
+            text = merged[j].strip()
+            if nb is None or not _CELL_AMOUNTS_RE.fullmatch(text):
+                break
+            n_cy = (nb[1] + nb[3]) / 2
+            if abs(n_cy - cy) > 0.5 * height or nb[0] < right - 2:
+                break
+            merged[i] = f"{merged[i].rstrip()} {text}"
+            merged[j] = ""
+            right = nb[2]
+            j += 1
+        i = j
+    return merged
+
+
+def _near_below(layout_lines: Sequence[LayoutLine] | None, lines: Sequence[str], upper: int, lower: int) -> bool:
+    """¿La línea `lower` está justo debajo de `upper`? Sin coordenadas fiables, se acepta (comportamiento anterior)."""
+    if not layout_lines or upper >= len(layout_lines) or lower >= len(layout_lines):
+        return True
+    a, b = layout_lines[upper].bbox, layout_lines[lower].bbox
+    if a is None or b is None:
+        return True
+    height = max(1.0, a[3] - a[1])
+    return b[1] - a[3] <= 1.5 * height
+
+
 # Recorre el bloque buscando la tabla de detalle y saca cada ítem (descripción, cantidad, unidad, precio y total).
 # Con ellos arma la descripción general. Sólo se guardan filas que encajan en un molde; nada se completa por suposición.
 def _extract_line_items(
@@ -2090,6 +2402,10 @@ def _extract_line_items(
     line_confidences: Mapping[str, float],
     layout_lines: Sequence[LayoutLine] | None,
 ) -> None:
+    # Las celdas de cifras de una misma fila se unen a su fila; los índices se conservan (las celdas quedan vacías).
+    aligned_layout = _aligned(lines, layout_lines)
+    lines = _merge_row_cells(lines, layout_lines)
+    header_has_punit = False
     # Estado: ¿estamos dentro de la tabla de detalle? Más los datos para unir descripciones partidas en varias líneas.
     in_table = False
     descriptions: list[tuple[str, int, int]] = []
@@ -2119,6 +2435,11 @@ def _extract_line_items(
         ):
             in_table = True
             has_code_column = bool(re.search(r"\bC[ÓO]DIGO\b", same_or_next_header, re.IGNORECASE))
+            # Con columnas V/U y P/U, la cifra del medio es el precio con IGV, no un descuento.
+            header_has_punit = bool(
+                re.search(r"\bP\s*/\s*U\b|\bP\.\s*UNIT|PRECIO\s+UNIT", same_or_next_header, re.IGNORECASE)
+                and re.search(r"\bV\s*/\s*U\b|\bV\.\s*UNIT|VALOR\s+UNIT", same_or_next_header, re.IGNORECASE)
+            )
             active_item_desc_idx = None
             previous_detail = None
             continue
@@ -2130,8 +2451,9 @@ def _extract_line_items(
             active_item_desc_idx = None
             continue
 
-        # Fila 1: ítem, descripción, unidad, cantidad, precio y total.
-        m_item = _ITEM_ROW_TABULAR.match(stripped)
+        # Fila 1: ítem, descripción, unidad, cantidad, precio y total. Si la fila empieza con cantidad y unidad
+        # («4 NIU …»), es la forma 2 aunque la descripción contenga otra unidad («31 KW»).
+        m_item = None if _starts_with_qty_and_unit(stripped) else _ITEM_ROW_TABULAR.match(stripped)
         if m_item:
             raw_idx = m_item.group("idx")
             item = _append_line_item(
@@ -2158,14 +2480,15 @@ def _extract_line_items(
         # Fila 2: cantidad, unidad, [código], descripción, precio unitario y total.
         m_qty_first = _ITEM_ROW_QTY_FIRST.match(stripped)
         if m_qty_first:
+            qf_unit, qf_desc = _unit_and_desc(m_qty_first.group("unit"), m_qty_first.group("desc"))
             item = _append_line_item(
                 result,
                 code=m_qty_first.group("code"),
-                desc=m_qty_first.group("desc"),
-                unit=m_qty_first.group("unit").upper(),
+                desc=qf_desc,
+                unit=qf_unit,
                 qty_obs=m_qty_first.group("qty"),
                 uprice_obs=m_qty_first.group("uprice"),
-                discount_obs=m_qty_first.group("dscto"),
+                discount_obs=None if header_has_punit else m_qty_first.group("dscto"),
                 total_obs=m_qty_first.group("total"),
                 page_number=page_number,
                 block_number=block_number,
@@ -2192,7 +2515,7 @@ def _extract_line_items(
                     break
                 merged_chunks.append(nxt)
                 candidate_row = " ".join(merged_chunks)
-                mw_tab = _ITEM_ROW_TABULAR.match(candidate_row)
+                mw_tab = None if _starts_with_qty_and_unit(candidate_row) else _ITEM_ROW_TABULAR.match(candidate_row)
                 if mw_tab:
                     raw_idx = mw_tab.group("idx")
                     item = _append_line_item(
@@ -2219,14 +2542,15 @@ def _extract_line_items(
                     break
                 mw_qty = _ITEM_ROW_QTY_FIRST.match(candidate_row)
                 if mw_qty:
+                    mw_unit, mw_desc = _unit_and_desc(mw_qty.group("unit"), mw_qty.group("desc"))
                     item = _append_line_item(
                         result,
                         code=mw_qty.group("code"),
-                        desc=mw_qty.group("desc"),
-                        unit=mw_qty.group("unit").upper(),
+                        desc=mw_desc,
+                        unit=mw_unit,
                         qty_obs=mw_qty.group("qty"),
                         uprice_obs=mw_qty.group("uprice"),
-                        discount_obs=mw_qty.group("dscto"),
+                        discount_obs=None if header_has_punit else mw_qty.group("dscto"),
                         total_obs=mw_qty.group("total"),
                         page_number=page_number,
                         block_number=block_number,
@@ -2244,6 +2568,19 @@ def _extract_line_items(
                     break
             if matched_wrapped:
                 continue
+
+        # Fuera de una tabla con cabecera (el OCR puede no leerla): la línea justo debajo de un ítem recién leído,
+        # si es texto descriptivo y no pie, continúa su descripción (validación del usuario, 2026-11-21).
+        if not in_table and active_item_desc_idx is not None and _is_descriptive_continuation_line(stripped):
+            li_idx, desc_idx = active_item_desc_idx
+            prev_desc, start_i, end_i = descriptions[desc_idx]
+            if index - end_i <= 1 and _near_below(aligned_layout, lines, end_i, index):
+                merged = re.sub(r"\s+", " ", f"{prev_desc} {stripped}").strip(" .|")
+                descriptions[desc_idx] = (merged, start_i, index)
+                result.line_items[li_idx].description_observed = merged
+                result.line_items[li_idx].description_normalized = merged
+                continue
+            active_item_desc_idx = None
 
         # Dentro de la tabla: filas sin unidad, filas descripción+total, descripciones sueltas o continuación multilínea.
         if in_table:
@@ -2266,6 +2603,59 @@ def _extract_line_items(
                     layout_lines=layout_lines,
                     heuristic_confidence=0.90,
                 )
+                descriptions.append((item.description_observed or "", index, index))
+                active_item_desc_idx = (len(result.line_items) - 1, len(descriptions) - 1)
+                previous_detail = None
+                continue
+
+            m_qdu = _ITEM_ROW_QTY_DESC_UNIT.match(stripped)
+            if m_qdu:
+                item = _append_line_item(
+                    result,
+                    code=m_qdu.group("code"),
+                    desc=m_qdu.group("desc"),
+                    unit=m_qdu.group("unit").upper(),
+                    qty_obs=m_qdu.group("qty"),
+                    uprice_obs=m_qdu.group("uprice"),
+                    total_obs=m_qdu.group("total"),
+                    page_number=page_number,
+                    block_number=block_number,
+                    index=index,
+                    lines=lines,
+                    line_confidences=line_confidences,
+                    layout_lines=layout_lines,
+                    heuristic_confidence=0.90,
+                )
+                descriptions.append((item.description_observed or "", index, index))
+                active_item_desc_idx = (len(result.line_items) - 1, len(descriptions) - 1)
+                previous_detail = None
+                continue
+
+            m_unit = _ITEM_ROW_PER_UNIT.match(stripped)
+            if m_unit:
+                item = _append_line_item(
+                    result,
+                    code=None,
+                    desc=m_unit.group("desc"),
+                    unit=m_unit.group("unit").upper(),
+                    qty_obs=m_unit.group("qty"),
+                    uprice_obs=m_unit.group("uprice"),
+                    total_obs=m_unit.group("total"),
+                    page_number=page_number,
+                    block_number=block_number,
+                    index=index,
+                    lines=lines,
+                    line_confidences=line_confidences,
+                    layout_lines=layout_lines,
+                    heuristic_confidence=0.90,
+                )
+                # Si el importe usa coma decimal («543 658,94»), el precio unitario también («8,600» = 8.600).
+                if re.search(r",\d{2}$", m_unit.group("total")):
+                    raw_price = re.sub(r"[\s.]", "", m_unit.group("uprice")).replace(",", ".")
+                    try:
+                        item.unit_price_normalized = str(Decimal(raw_price))
+                    except InvalidOperation:
+                        item.unit_price_normalized = None
                 descriptions.append((item.description_observed or "", index, index))
                 active_item_desc_idx = (len(result.line_items) - 1, len(descriptions) - 1)
                 previous_detail = None
@@ -2316,8 +2706,8 @@ def _extract_line_items(
                 if active_item_desc_idx is not None and _is_descriptive_continuation_line(stripped):
                     li_idx, desc_idx = active_item_desc_idx
                     prev_desc, start_i, end_i = descriptions[desc_idx]
-                    if index - end_i <= 2:
-                        merged = f"{prev_desc} {stripped}".strip()
+                    if index - end_i <= 2 and _near_below(aligned_layout, lines, end_i, index):
+                        merged = f"{prev_desc} {stripped}".strip(" .|")
                         merged_norm = re.sub(r"\s+", " ", merged)
                         descriptions[desc_idx] = (merged_norm, start_i, index)
                         result.line_items[li_idx].description_observed = merged_norm
@@ -2326,18 +2716,32 @@ def _extract_line_items(
                         continue
                 if previous_detail is not None and _is_descriptive_continuation_line(stripped):
                     desc, start, end = descriptions[previous_detail]
-                    if index - end <= 2:
-                        descriptions[previous_detail] = (f"{desc} {stripped}".strip(), start, index)
+                    if index - end <= 2 and _near_below(aligned_layout, lines, end, index):
+                        descriptions[previous_detail] = (f"{desc} {stripped}".strip(" .|"), start, index)
                         continue
                 previous_detail = None
                 active_item_desc_idx = None
                 if _is_descriptive_continuation_line(stripped):
-                    zone_descriptions.append((stripped, index, index))
+                    if (
+                        zone_descriptions
+                        and index - zone_descriptions[-1][2] <= 2
+                        and _near_below(aligned_layout, lines, zone_descriptions[-1][2], index)
+                    ):
+                        prev_text, prev_start, _ = zone_descriptions[-1]
+                        zone_descriptions[-1] = (f"{prev_text.rstrip(' .')} {stripped}".strip(" .|"), prev_start, index)
+                    else:
+                        zone_descriptions.append((stripped.strip(" .|"), index, index))
 
     # Respaldo de zona: si se detectó encabezado de tabla pero ningún molde rígido capturó las columnas,
     # conservamos las líneas descriptivas reales observadas dentro de la zona de detalle.
     if not descriptions and zone_descriptions:
         descriptions = zone_descriptions
+    elif descriptions and zone_descriptions:
+        # La glosa escrita dentro de la tabla, antes del primer ítem, también describe el comprobante
+        # (validación del usuario, 2026-11-21).
+        first_item = min(start for _, start, _ in descriptions)
+        glosa = [entry for entry in zone_descriptions if entry[2] < first_item and _looks_like_text(entry[0])]
+        descriptions = glosa + descriptions
 
     # La descripción general une glosas de cabecera y descripciones del detalle (sin perder ítems ni duplicar).
     if descriptions:
@@ -2359,6 +2763,16 @@ def _extract_line_items(
                 line_number=layout_lines[start].line_number if layout_lines and start < len(layout_lines) else start + 1,
                 bbox=_line_bbox(indexes, layout_lines),
             )
+
+
+_RHE_THRESHOLD_PEN = Decimal("1500.00")
+# «Constancia de suspensión», «suspensión de (la) retención», «Formulario (Virtual) N° 1609».
+_RHE_SUSPENSION_RE = re.compile(
+    r"\bCONSTANCIA\s+DE\s+SUSPENSI[ÓO]N\b|\bSUSPENSI[ÓO]N\s+DE\s+(?:LAS?\s+)?RETENCI[ÓO]N(?:ES)?\b|"
+    r"\bRETENCI[ÓO]N(?:ES)?\s+SUSPENDIDAS?\b|\bFORM(?:ULARIO)?\.?\s*(?:VIRTUAL\s*)?(?:N[°º.]?\s*)?1609\b",
+    re.IGNORECASE,
+)
+_EXCHANGE_RATE_RE = re.compile(r"\b(?:TIPO\s+DE\s+CAMBIO|T\.?\s*C\.?)\s*[:=]?\s*(?:S/\.?\s*)?(\d{1,2}[.,]\d{2,4})\b", re.IGNORECASE)
 
 
 # Controles que se calculan al final, con el comprobante ya completo: falta de descripción, de fecha o de razón social
@@ -2408,12 +2822,18 @@ def _compute_derived_checks(
         result.secondary_review_fields.append("issuer_name")
     # Este umbral indica qué lecturas conviene mirar de nuevo. No cambia el tipo
     # detectado ni reemplaza los caracteres que leyó Tesseract.
+    # El umbral cubre también los importes que sostienen el cuadre:
+    # un total leído con confianza baja puede cuadrar por azar.
     fields = {
         "document_type": ("Denominación", result.document_type),
         "emitter_ruc": ("RUC emisor", result.emitter_ruc),
         "recipient_ruc": ("RUC receptor", result.recipient_ruc),
         "series": ("Serie", result.series),
         "correlativo": ("Correlativo", result.correlativo_normalized),
+        **{
+            field: (_AMOUNT_LABELS[field], getattr(result, field))
+            for field in ("subtotal", "valor_venta", "gravado", "igv", "total", "total_a_pagar")
+        },
     }
     for field, (label, value) in fields.items():
         evidence = [item for item in result.field_evidence.get(field, []) if item.normalized_value == value]
@@ -2433,6 +2853,26 @@ def _compute_derived_checks(
         })
         if field not in result.secondary_review_fields:
             result.secondary_review_fields.append(field)
+    # Importes con separador ambiguo («10.000»): quedaron en blanco y se anotan con su lectura literal.
+    for field in AMOUNT_FIELDS:
+        ambiguous = [item for item in result.field_evidence.get(field, []) if item.field_status == AMBIGUOUS_AMOUNT_STATUS]
+        if not ambiguous:
+            continue
+        first = ambiguous[0]
+        result.derived_checks.append({
+            "check": "ambiguous_amount_format",
+            "consistent": False,
+            "field": _AMOUNT_LABELS[field],
+            "observed_value": first.observed_value,
+            "page": first.page_number,
+            "excerpt": first.excerpt,
+            "reason": (
+                f"El importe «{first.observed_value}» puede leerse con el punto o la coma como separador de miles "
+                "o como decimal. No se dio por leído: anótelo a mano desde el original."
+            ),
+        })
+        if field not in result.secondary_review_fields:
+            result.secondary_review_fields.append(field)
     # Se compara el total una vez, cuando ya se reunieron las páginas del comprobante.
     check = reconcile_amounts(result, rounding_tolerance=rounding_tolerance)
     result.derived_checks.append(check)
@@ -2447,7 +2887,9 @@ def _compute_derived_checks(
     # Control informativo de tasa de IGV (18 % general, 10 %/10.5 %/15 % régimen especial restaurantes/hoteles Ley 31556/32219/32387, 4 % IVAP, 0 % exonerado/inafecto).
     igv_check = evaluate_igv_rate(result)
     result.derived_checks.append(igv_check)
-    if not igv_check.get("consistent"):
+    # Va a revisión si la tasa no cuadra o si no se pudo comparar en un tipo que discrimina IGV (needs_review).
+    # «no_aplica» y la boleta sin desglose quedan con consistent None, sin contar como verificados ni como fallo.
+    if igv_check.get("consistent") is False or igv_check.get("needs_review"):
         if "igv_rate" not in result.secondary_review_fields:
             result.secondary_review_fields.append("igv_rate")
         if igv_check.get("reason"):
@@ -2456,20 +2898,41 @@ def _compute_derived_checks(
         result.observations.append(igv_check["reason"])
 
     # Si el Recibo por Honorarios supera S/ 1,500 y no registra retención del 8 %, avisamos si tampoco figura suspensión (Form. 1609).
+    # La palabra «suspensión» solo cuenta junto a «constancia» o «retención»
+    # (o el Formulario 1609), no en cualquier glosa; y el umbral se aplica en soles. Un recibo en otra moneda
+    # se convierte con el tipo de cambio impreso; sin él, va a revisión porque no se puede comparar.
     if result.document_type == "02" and result.subtotal:
         try:
             gross_rxh = Decimal(result.subtotal)
             ret_rxh = abs(Decimal(result.importe_retencion)) if result.importe_retencion else Decimal("0")
-            if gross_rxh > Decimal("1500.00") and ret_rxh == Decimal("0") and not re.search(
-                r"\b(?:SUSPENSI[ÓO]N|1609)\b", result.extracted_text or "", re.IGNORECASE
-            ):
+            text = result.extracted_text or ""
+            has_suspension = bool(_RHE_SUSPENSION_RE.search(text))
+            reason = None
+            if ret_rxh == 0 and not has_suspension:
+                if result.currency in (None, "PEN"):
+                    if gross_rxh > _RHE_THRESHOLD_PEN:
+                        reason = "RHE mayor a S/ 1,500 sin retención de IR (8%) ni constancia de suspensión visible (Form. 1609)."
+                else:
+                    rate_match = _EXCHANGE_RATE_RE.search(text)
+                    rate = Decimal(rate_match.group(1).replace(",", ".")) if rate_match else None
+                    if rate is None:
+                        reason = (
+                            f"RHE en {result.currency} sin retención de IR ni constancia de suspensión, y sin tipo de cambio "
+                            "impreso: no se puede comparar con el umbral de S/ 1,500."
+                        )
+                    elif gross_rxh * rate > _RHE_THRESHOLD_PEN:
+                        reason = (
+                            f"RHE de {result.currency} {gross_rxh} (S/ {gross_rxh * rate:.2f} al tipo de cambio {rate}) mayor a "
+                            "S/ 1,500 sin retención de IR (8%) ni constancia de suspensión visible."
+                        )
+            if reason:
                 result.derived_checks.append({
                     "check": "rhe_retencion_check",
                     "consistent": False,
                     "field": "Retención IR 4ta",
                     "page": result.page_start,
                     "excerpt": result.detection_excerpt or "",
-                    "reason": "RHE mayor a S/ 1,500 sin retención de IR (8%) ni mención visible de suspensión (Form. 1609).",
+                    "reason": reason,
                 })
                 if "importe_retencion" not in result.secondary_review_fields:
                     result.secondary_review_fields.append("importe_retencion")
@@ -2783,7 +3246,14 @@ def _parse_block(
         return result
 
     # Paso 2: ¿es un documento de soporte conocido (HES, orden de compra, estado de cuenta, constancia SPOT...)? Se descarta antes de buscar datos fiscales.
+    # Excepción: si el bloque tiene la estructura completa de un comprobante
+    # (RUC válido, serie-correlativo, IGV y total), la frase de soporte puede ser solo una cita en la glosa.
+    # Ese bloque no se descarta en silencio: sigue la extracción normal y, si no se confirma el tipo, queda indeterminado.
     non_receipt_type, non_receipt_rule = _detect_non_receipt_type(nonempty)
+    support_with_receipt_structure: str | None = None
+    if non_receipt_type in _GUARDED_SUPPORT_TYPES and _has_receipt_structure(nonempty):
+        support_with_receipt_structure = non_receipt_type
+        non_receipt_type = None
     if non_receipt_type is not None:
         result.detection_status = NOT_RECEIPT
         result.identity_status = IDENTITY_NOT_APPLICABLE
@@ -2877,6 +3347,19 @@ def _parse_block(
         result.classification_rule = "non_receipt_no_fiscal_signals"
         result.detection_reason = "Contenido legible sin señales de comprobante de pago."
         result.observations.append("contenido legible sin señales de comprobante de pago")
+
+    if support_with_receipt_structure is not None:
+        if result.detection_status == NOT_RECEIPT:
+            result.detection_status = AMBIGUOUS
+        if result.detection_status == AMBIGUOUS:
+            result.classification_rule = "soporte_con_estructura_de_comprobante"
+            result.detection_reason = (
+                f"El bloque contiene una frase propia de {support_with_receipt_structure}, pero también RUC válido, "
+                "serie-correlativo, IGV y total. No se descarta como soporte: revise si es un comprobante con el título ilegible."
+            )
+        result.observations.append(
+            f"cita de {support_with_receipt_structure} dentro de un bloque con estructura de comprobante; no se descartó como soporte"
+        )
 
     # Paso 5: con el tipo ya decidido, evaluar si la identidad está completa y armar el comentario final de la decisión.
     _finalize_identity_and_reasons(
@@ -3020,6 +3503,29 @@ def _merge_page(
         (it.page_number, it.description_normalized or it.description_observed, it.line_total_normalized or it.line_total_observed)
         for it in target.line_items
     }
+    # Una página que repite, uno a uno, ítems ya leídos (misma descripción e importe) es otra copia del mismo
+    # comprobante: sumar sus ítems duplicaría el detalle. Si trae al menos un ítem nuevo,
+    # es una página de continuación y se conservan todos.
+    def _item_sig(it: LineItem) -> tuple[str, str | None]:
+        desc = re.sub(r"[^A-Z0-9]", "", unicodedata.normalize("NFKD", it.description_normalized or it.description_observed or "")
+                      .encode("ascii", "ignore").decode().upper())
+        return "".join(sorted(desc)), it.line_total_normalized or it.line_total_observed
+
+    if continuation.line_items:
+        pending = [_item_sig(it) for it in target.line_items]
+        repeated = True
+        for it in continuation.line_items:
+            sig = _item_sig(it)
+            if sig in pending:
+                pending.remove(sig)
+            else:
+                repeated = False
+                break
+        if repeated:
+            target.observations.append(
+                f"La página {continuation.page_start} repite los ítems ya leídos (otra copia del comprobante); no se suman."
+            )
+            continuation.line_items = []
     for item in continuation.line_items:
         sig = (item.page_number, item.description_normalized or item.description_observed, item.line_total_normalized or item.line_total_observed)
         if sig not in existing_same_page:
@@ -3135,9 +3641,3 @@ def parse_document(
         )
     ]
 
-
-# DEPRECADO: nadie lo llama. Era un atajo para analizar una sola página de texto.
-def parse_fields(text: str, catalog: Mapping[str, str] | None = None) -> ExtractionResult:
-    """Atajo antiguo para analizar una sola página de texto; prioriza los comprobantes detectados si hubo segmentación."""
-    results = parse_document([(1, text)], catalog)
-    return next((item for item in results if item.comprobante_detectado), results[0])

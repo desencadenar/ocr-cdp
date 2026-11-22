@@ -305,6 +305,8 @@ class CompactFiscalUI:
                 cancel_event=self._cancel_event,
             )
             workbook = export_results(processor.store, output_path, summary=summary)
+            if not config.keep_run_state:
+                processor.discard_state()
             self._queue.put(("done", (summary, workbook)))
         except Exception as exc:
             self._queue.put(("error", f"{type(exc).__name__}: {exc}"))

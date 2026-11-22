@@ -1,4 +1,4 @@
-"""Interfaz de línea de comandos para ejecutar análisis, reexportación, calibración, carga de padrón y ventana."""
+"""Interfaz de línea de comandos: análisis, redetección sin OCR, reexportación, calibración, padrón y ventana."""
 
 from __future__ import annotations
 
@@ -30,12 +30,30 @@ def _parser() -> argparse.ArgumentParser:
     scan.add_argument("--recipient-ruc", required=True, help="RUC receptor que se desea contrastar")
     scan.add_argument("--config", type=Path, help="Archivo JSON de ajustes. Por defecto, config.json.")
     scan.add_argument("--padron-db", type=Path, help="Padrón SQLite local para contrastar la razón social")
+    scan.add_argument(
+        "--consulta-ruc",
+        type=Path,
+        help="Archivo de la consulta RUC múltiple SUNAT (salida de consulta_ruc.py) con el CIIU de los emisores",
+    )
     scan.add_argument("--no-inspect-archives", action="store_true", help="Omitir el contenido de los ZIP")
     scan.add_argument(
         "--exportar-pdf",
         action="store_true",
         help="Generar expediente en PDF ordenado por proveedor dentro de la carpeta de salida",
     )
+
+    # redetectar: repite la detección con las lecturas guardadas de una corrida, sin Tesseract.
+    redetect = commands.add_parser(
+        "redetectar", help="Repetir la detección y el Excel con las lecturas guardadas de una corrida, sin OCR"
+    )
+    redetect.add_argument("--output", type=Path, required=True, help="Carpeta de la corrida de origen")
+    redetect.add_argument("--destino", type=Path, help="Carpeta nueva del resultado. Por omisión, <corrida>_redetectar")
+    redetect.add_argument("--input", type=Path, help="Carpeta de documentos. Por omisión, la de la corrida de origen")
+    redetect.add_argument("--recipient-ruc", help="Por omisión, el de la corrida de origen")
+    redetect.add_argument("--config", type=Path, help="Archivo JSON de ajustes. Por defecto, config.json.")
+    redetect.add_argument("--padron-db", type=Path, help="Padrón SQLite local")
+    redetect.add_argument("--consulta-ruc", type=Path, help="Archivo de la consulta RUC múltiple SUNAT")
+    redetect.add_argument("--exportar-pdf", action="store_true", help="Generar el expediente PDF")
 
     # export: vuelve a armar el Excel a partir del estado guardado de una corrida, sin releer los documentos.
     export = commands.add_parser("export", help="Volver a generar el Excel desde el estado de una corrida")
@@ -77,6 +95,58 @@ def _recipient(value: str) -> str:
     return value
 
 
+# redetectar: arma una corrida nueva leyendo cada documento de lecturas.sqlite3 en lugar de pasar por Tesseract.
+# Los ajustes que no se indiquen (entrada, RUC objetivo, padrón, consulta RUC, expediente PDF) son los de origen.
+def _redetect(args: argparse.Namespace) -> Path:
+    from .reading_cache import CACHE_FILENAME
+
+    origin = args.output.resolve()
+    readings = origin / ".ocr_fiscal" / CACHE_FILENAME
+    state = origin / ".ocr_fiscal" / "state.sqlite3"
+    if not readings.is_file():
+        raise ValueError(
+            f"La corrida {origin} no tiene lecturas guardadas ({CACHE_FILENAME}). "
+            "Córrala de nuevo con guardar_lectura_completa en true."
+        )
+    run = (StateStore(state).get_latest_run_metadata() or {}) if state.is_file() else {}
+    meta = run.get("run_config") or {}
+    source = (args.input or Path(meta.get("input_root") or "")).resolve() if (args.input or meta.get("input_root")) else None
+    if source is None or not source.is_dir():
+        raise ValueError("Indique la carpeta de documentos con --input (la corrida de origen no la registra).")
+    destination = args.destino
+    if destination is None:
+        destination = origin.with_name(f"{origin.name}_redetectar")
+        n = 2
+        while destination.exists():
+            destination = origin.with_name(f"{origin.name}_redetectar_{n}")
+            n += 1
+    destination = destination.resolve()
+    if destination == source or source in destination.parents:
+        raise ValueError("Elija un destino fuera de la carpeta de documentos.")
+    config = load_config(args.config)
+    config.recipient_ruc = _recipient(args.recipient_ruc or run.get("target_recipient_ruc") or meta.get("target_recipient_ruc") or "")
+    padron = args.padron_db or (Path(meta["padron_ruc"]) if meta.get("padron_ruc") else None)
+    if padron is not None:
+        config.padron_db_path = padron
+    consulta = args.consulta_ruc or (Path(meta["consulta_ruc"]) if meta.get("consulta_ruc") else None)
+    if consulta is not None:
+        from .ciiu import load_consulta_ruc
+
+        load_consulta_ruc(consulta)
+        config.consulta_ruc_path = consulta
+    config.inspect_archives = config.inspect_nested_archives = bool(meta.get("inspect_archives", True))
+    config.export_pdf_folders = bool(args.exportar_pdf or meta.get("exportar_pdf_ordenado"))
+    processor = FiscalProcessor(destination, config, replay_readings=readings)
+    try:
+        summary = processor.scan(source)
+        workbook = export_results(processor.store, destination, summary=summary)
+    finally:
+        processor.close_readings()
+    if not config.keep_run_state:
+        processor.discard_state()
+    return workbook
+
+
 # Punto de entrada: interpreta la línea de comandos y ejecuta el comando elegido.
 # Devuelve 0 si todo salió bien y 2 si hubo un error de uso.
 def main(argv: Sequence[str] | None = None) -> int:
@@ -98,6 +168,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Las opciones de la línea de comandos pisan a lo que diga config.json.
             if args.padron_db is not None:
                 config.padron_db_path = args.padron_db
+            if args.consulta_ruc is not None:
+                if not args.consulta_ruc.is_file():
+                    raise ValueError(f"No existe el archivo de consulta RUC {args.consulta_ruc}.")
+                config.consulta_ruc_path = args.consulta_ruc
+            # Se valida la consulta RUC antes del OCR, para no descubrir un archivo inservible al final.
+            if config.consulta_ruc_path is not None:
+                from .ciiu import load_consulta_ruc
+
+                load_consulta_ruc(config.consulta_ruc_path)
             if args.no_inspect_archives:
                 config.inspect_archives = False
                 config.inspect_nested_archives = False
@@ -107,6 +186,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             processor = FiscalProcessor(output, config)
             summary = processor.scan(source)
             workbook = export_results(processor.store, output, summary=summary)
+            processor.close_readings()
+            if not config.keep_run_state:
+                processor.discard_state()
+        elif args.command == "redetectar":
+            workbook = _redetect(args)
         # export: reabrir la base de la corrida y regenerar el Excel.
         elif args.command == "export":
             state = args.output / ".ocr_fiscal" / "state.sqlite3"

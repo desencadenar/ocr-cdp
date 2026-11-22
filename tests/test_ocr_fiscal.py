@@ -285,9 +285,12 @@ class TestAmountsAndIGV(unittest.TestCase):
         self.assertTrue(c_round["consistent"])
         self.assertEqual(c_round["status"], "cuadra_con_redondeo")
 
-        # 7. Nota de crédito signos mixtos y Tipo 13
+        # 7. Nota de crédito: signos coherentes cuadran; signos mezclados entre componentes van a revisión
+        #.
+        r_nc_pos = ExtractionResult(document_type="07", gravado="100.00", igv="18.00", total="-118.00")
+        self.assertTrue(reconcile_amounts(r_nc_pos)["consistent"])
         r_nc_mix = ExtractionResult(document_type="07", gravado="-100.00", igv="18.00", total="-118.00")
-        self.assertTrue(reconcile_amounts(r_nc_mix)["consistent"])
+        self.assertFalse(reconcile_amounts(r_nc_mix)["consistent"])
 
         r_nc_13 = ExtractionResult(document_type="07", note_type_code="13", total="0.00")
         self.assertTrue(reconcile_amounts(r_nc_13)["consistent"])
@@ -311,26 +314,38 @@ class TestAmountsAndIGV(unittest.TestCase):
 
         # 10 % régimen especial restaurantes y hoteles en 2025 (8 % IGV Ley 31556 + 2 % IPM)
         chk_10 = evaluate_igv_rate(ExtractionResult(document_type="01", issue_date="2025-08-15", gravado="100.00", igv="10.00", total="110.00"))
-        self.assertTrue(chk_10["consistent"])
+        # El giro del emisor no se conoce, así que la tasa especial
+        # se reconoce pero queda para verificar (antes se exigía consistent True).
+        self.assertEqual(chk_10["status"], "tasa_especial_verificar")
+        self.assertTrue(chk_10["needs_review"])
         self.assertEqual(chk_10["matched_rate"], 10.0)
 
         # 10.5 % régimen especial restaurantes y hoteles en 2026 (8 % IGV Ley 32219 + 2.5 % IPM Ley 32387)
         chk_105 = evaluate_igv_rate(ExtractionResult(document_type="01", issue_date="2026-04-10", gravado="100.00", igv="10.50", total="110.50"))
-        self.assertTrue(chk_105["consistent"])
+        # El giro del emisor no se conoce, así que la tasa especial
+        # se reconoce pero queda para verificar (antes se exigía consistent True).
+        self.assertEqual(chk_105["status"], "tasa_especial_verificar")
+        self.assertTrue(chk_105["needs_review"])
         self.assertEqual(chk_105["matched_rate"], 10.5)
 
         # 15 % régimen especial restaurantes y hoteles en 2027 (12 % IGV Ley 32219 + 3.0 % IPM Ley 32387)
         chk_15 = evaluate_igv_rate(ExtractionResult(document_type="01", issue_date="2027-02-15", gravado="100.00", igv="15.00", total="115.00"))
-        self.assertTrue(chk_15["consistent"])
+        # El giro del emisor no se conoce, así que la tasa especial
+        # se reconoce pero queda para verificar (antes se exigía consistent True).
+        self.assertEqual(chk_15["status"], "tasa_especial_verificar")
+        self.assertTrue(chk_15["needs_review"])
         self.assertEqual(chk_15["matched_rate"], 15.0)
 
         # 10 % en nota de crédito emitida en 2026 por operación de 2025
         chk_nc_prior = evaluate_igv_rate(ExtractionResult(document_type="07", issue_date="2026-01-15", gravado="100.00", igv="10.00", total="110.00"))
-        self.assertTrue(chk_nc_prior["consistent"])
+        # El giro del emisor no se conoce, así que la tasa especial
+        # se reconoce pero queda para verificar (antes se exigía consistent True).
+        self.assertEqual(chk_nc_prior["status"], "tasa_especial_verificar")
+        self.assertTrue(chk_nc_prior["needs_review"])
         self.assertEqual(chk_nc_prior["matched_rate"], 10.0)
 
-        # 4% IVAP
-        chk_4 = evaluate_igv_rate(ExtractionResult(document_type="01", issue_date="2026-02-01", gravado="100.00", igv="4.00", total="104.00"))
+        # 4% IVAP: solo con mención de IVAP o arroz pilado
+        chk_4 = evaluate_igv_rate(ExtractionResult(document_type="01", issue_date="2026-02-01", gravado="100.00", igv="4.00", total="104.00", extracted_text="ARROZ PILADO (IVAP)"))
         self.assertTrue(chk_4["consistent"])
         self.assertEqual(chk_4["matched_rate"], 4.0)
 
@@ -553,7 +568,8 @@ class TestExtractionAndMetadata(unittest.TestCase):
         self.assertEqual(details["code"][0], "022")
         self.assertEqual(details["account"][0], "00-058-123456")
 
-        # Monto 1.250 (3 decimales con punto) en factura no debe virar a 1250
+        # Monto 1.250 (punto seguido de tres dígitos) es ambiguo: puede ser 1 250 o 1.25. No se elige
+        # ninguna lectura; el total queda en blanco y el comprobante va a revisión.
         p_dec = make_page(
             [
                 "FERRETERIA NORTE S.A.C.",
@@ -566,7 +582,9 @@ class TestExtractionAndMetadata(unittest.TestCase):
             ]
         )
         res_dec = parse_document([p_dec], target_recipient_ruc=RUC_RECEPTOR)[0]
-        self.assertEqual(res_dec.total, "1.25")
+        self.assertIsNone(res_dec.total)
+        self.assertTrue(res_dec.requires_human_review)
+        self.assertTrue(any(c.get("check") == "ambiguous_amount_format" for c in res_dec.derived_checks))
 
     def test_electro_row_items_sum_check_and_zero_qty(self) -> None:
         # Fila de detalle sin columna de precio unitario: valida que no se invente precio y que sume contra cabecera
@@ -624,9 +642,12 @@ class TestPadron(unittest.TestCase):
         st2, _ = compare_names_with_padron("JUAN CARLOS PEREZ GOMEZ", "PEREZ GOMEZ JUAN CARLOS", ruc=RUC_NAT_C)
         self.assertIn(st2, {"coincide_exacto", "coincide_con_ruido_ocr"})
 
-        # Posible nombre comercial frente a discrepancia total de razón social
+        # Posible nombre comercial frente a discrepancia total de razón social.
+        # Dos nombres sin ninguna palabra distintiva en común son discrepancia, no nombre comercial.
         st3, _ = compare_names_with_padron("TIENDA LA ECONOMICA", "COMERCIAL DEL SUR DEMO S.A.", ruc=RUC_EMISOR_A)
-        self.assertEqual(st3, "posible_nombre_comercial")
+        self.assertEqual(st3, "discrepancia")
+        st3b, _ = compare_names_with_padron("TIENDA LA ECONOMICA", "LA ECONOMICA DEL SUR DEMO S.A.", ruc=RUC_EMISOR_A)
+        self.assertEqual(st3b, "posible_nombre_comercial")
 
         st4, _ = compare_names_with_padron("FERRETERIA LOS ANDES S.R.L.", "TEXTILES PACIFICO S.A.", ruc=RUC_EMISOR_A)
         self.assertEqual(st4, "discrepancia")

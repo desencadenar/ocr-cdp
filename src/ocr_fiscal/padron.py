@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Sequence
 import zipfile
 
 from .tax import validate_ruc
@@ -107,10 +107,16 @@ def compare_names_with_padron(
         return "no_evaluable", 0.0
     if norm_obs == norm_pad:
         return "coincide_exacto", 1.0
-    # Coincidencia cuando un comprobante abrevia o corta el final de una razón social larga.
-    if len(norm_obs) >= 6 and (norm_obs in norm_pad or norm_pad in norm_obs):
-        ratio = round(min(len(norm_obs), len(norm_pad)) / max(len(norm_obs), len(norm_pad)), 4)
+    # El comprobante corta el final de una razón social larga: solo cuenta si el corte cae a mitad de palabra
+    # («LIMA NOR» por «LIMA NORTE»). Una palabra entera de más o de menos («LIMA» frente a «LIMA NORTE») es otra
+    # razón social.
+    shorter, longer = sorted((norm_obs, norm_pad), key=len)
+    if len(shorter) >= 6 and longer.startswith(shorter) and longer[len(shorter)] != " ":
+        ratio = round(len(shorter) / len(longer), 4)
         return "coincide_exacto", max(ratio, 0.85)
+    # Solo cambian los espacios («SANMARTIN» por «SAN MARTIN»).
+    if norm_obs.replace(" ", "") == norm_pad.replace(" ", ""):
+        return "coincide_con_ruido_ocr", 0.95
 
     obs_tokens = set(norm_obs.split())
     pad_tokens = set(norm_pad.split())
@@ -119,24 +125,48 @@ def compare_names_with_padron(
     # En personas naturales (RUC 10), SUNAT guarda "APELLIDO1 APELLIDO2 NOMBRES" y los RHE imprimen "NOMBRES APELLIDOS".
     if is_natural_person and len(obs_tokens) >= 2 and obs_tokens == pad_tokens:
         return "coincide_exacto", 1.0
-    if (is_natural_person and jaccard >= 0.75 and len(obs_tokens & pad_tokens) >= 2) or (
-        jaccard >= 0.85 and len(obs_tokens & pad_tokens) >= 3
-    ):
-        return "coincide_con_ruido_ocr", round(max(jaccard, 0.85), 4)
 
     seq_score = SequenceMatcher(None, norm_obs, norm_pad).ratio()
     combined = round(max(seq_score, (seq_score + jaccard) / 2.0), 4)
-    if seq_score >= 0.84 or (jaccard >= 0.75 and seq_score >= 0.72):
+    # Ruido de OCR: las palabras que difieren se emparejan una a una con otra casi igual y ninguna lleva números.
+    # Una palabra distinta («MARTIN» frente a «MARCOS») o un número distinto («NORTE 1» frente a «NORTE 2») no lo es.
+    if _differences_look_like_ocr_noise(obs_tokens, pad_tokens) and (seq_score >= 0.84 or jaccard >= 0.5):
         return "coincide_con_ruido_ocr", combined
-    # Si el nombre observado carece de forma societaria mientras el padrón sí tiene una (p. ej. "TIENDA LA ECONOMICA" vs "COMERCIAL DEL SUR DEMO S.A."),
-    # suele tratarse de un nombre comercial y no de una suplantación societaria.
+    # Posible nombre comercial: el nombre observado no tiene forma societaria, el padrón sí, y comparten al menos
+    # una palabra distintiva. Dos nombres sin ninguna relación son una discrepancia.
     obs_upper = (observed_name or "").upper()
     pad_upper = (padron_name or "").upper()
-    if (not _CORP_SUFFIX_RE.search(obs_upper) and _CORP_SUFFIX_RE.search(pad_upper)) or (
-        is_natural_person and len(obs_tokens & pad_tokens) == 0
-    ):
+    shares_distinctive = bool((obs_tokens & pad_tokens) - _GENERIC_NAME_TOKENS)
+    if shares_distinctive and not _CORP_SUFFIX_RE.search(obs_upper) and (_CORP_SUFFIX_RE.search(pad_upper) or is_natural_person):
         return "posible_nombre_comercial", combined
     return "discrepancia", combined
+
+
+# Palabras que no distinguen a una empresa de otra al buscar un nombre comercial.
+_GENERIC_NAME_TOKENS = frozenset({
+    "DE", "DEL", "LA", "LAS", "LOS", "EL", "Y", "E", "EN", "SAN", "SANTA",
+    "SERVICIOS", "GENERALES", "COMERCIAL", "INVERSIONES", "EMPRESA", "GRUPO", "CORPORACION", "COMPANIA",
+    "INDUSTRIAS", "NEGOCIACIONES", "DISTRIBUIDORA", "IMPORTACIONES", "EXPORTACIONES", "TRANSPORTES",
+    "PERU", "LIMA", "SUR", "NORTE", "CENTRO",
+})
+
+
+def _differences_look_like_ocr_noise(obs_tokens: set[str], pad_tokens: set[str]) -> bool:
+    only_obs = sorted(obs_tokens - pad_tokens)
+    only_pad = sorted(pad_tokens - obs_tokens)
+    if len(only_obs) != len(only_pad):
+        return False
+    if any(any(ch.isdigit() for ch in tok) for tok in only_pad):
+        return False
+    remaining = list(only_pad)
+    for tok in only_obs:
+        if any(ch.isdigit() for ch in tok) and not re.fullmatch(r"[A-Z]*[01][A-Z]*", tok):
+            return False  # un número propio, no un 0/1 leído por O/I
+        best = max(remaining, key=lambda cand: SequenceMatcher(None, tok, cand).ratio(), default=None)
+        if best is None or SequenceMatcher(None, tok, best).ratio() < 0.8:
+            return False
+        remaining.remove(best)
+    return True
 
 
 # ¿El nombre leído en el comprobante contradice al del padrón? Sólo da True cuando hay discrepancia real.

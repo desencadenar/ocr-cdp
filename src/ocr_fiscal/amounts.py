@@ -38,13 +38,13 @@ AMOUNT_COLUMNS = (
 AMOUNT_FIELDS = tuple(field for _, field in AMOUNT_COLUMNS)
 
 # Prefijo opcional que suele ir delante de los rótulos de las bases: «Total», «Valor de venta», «Operaciones» u «Op.».
-_BASE_LABEL = r"(?:(?:TOTAL\s+)?(?:VALOR\s+DE\s+VENTA\s*[-–:]?\s*)?(?:OPERACIONES|OP\.?)\s*|TOTAL\s+)?"
+_BASE_LABEL = r"(?:(?:TOTAL\s+)?(?:VALOR\s+DE\s+VENTA\s*[-–:]?\s*)?(?:OPERACIONES|OPER\.?|OPE\.?|OP\.?)\s*|TOTAL\s+)?"
 # Cómo suele estar escrito cada importe en el papel: una expresión por campo.
 # El orden importa: si un rótulo contiene a otro («no gravado» y «gravado»), el más específico va primero.
 # Incluye también los rótulos propios de los Recibos por Honorarios Electrónicos (02) de SUNAT.
 _LABELS = (
     ("no_gravado", _BASE_LABEL + r"NO\s+GRAVAD[AO]S?"),
-    ("gravado", _BASE_LABEL + r"(?:GRAVAD[AO]S?|AFECT[AO]S?|BASE\s+IMPONIBLE(?:\s+IGV)?)"),
+    ("gravado", _BASE_LABEL + r"(?:GRAVAD[AO]S?|AFECT[AO]S?|BASE\s+IMPONIBLE(?:\s+IGV)?)|TAXABLE\s+AMOUNT"),
     ("inafecto", _BASE_LABEL + r"INAFECT[AO]S?"),
     ("exonerado", _BASE_LABEL + r"EXONERAD[AO]S?"),
     ("gratuitas", _BASE_LABEL + r"GRATUIT[AO]S?"),
@@ -56,7 +56,9 @@ _LABELS = (
     ("otros_cargos", r"(?:TOTAL\s+)?(?:OTROS\s+CARGOS|CARGOS\s+GLOBALES)"),
     ("recargo_consumo", r"(?:(?:RECARGO|REC\.?)\s+(?:(?:AL|DE|POR)\s+)?(?:CONSUMO|SERVICIO)|CARGO\s+POR\s+SERVICIO|SERVICIO\s+\(?10\s*%\)?|R\.?C\.?\s*\(?10\s*%\)?)"),
     ("recargo_fise", r"RECARGO\s+FISE(?:\s*\(\s*OP\.?\s*INAFECTA\s*\))?"),
-    ("igv", r"(?:TOTAL\s+)?[I1]\.?G\.?V\.?"),
+    # «16V» es el «IGV» mal leído por el OCR; amount_mentions solo lo acepta al comienzo de la línea.
+    # «LG.V (10%)» también es el «I.G.V» mal leído, solo seguido del porcentaje o de dos puntos.
+    ("igv", r"(?:TOTAL\s+)?[I1]\.?G\.?V\.?|\bVAT\b|[I1]6V(?=\s+S)|L\.?G\.?V\.?(?=\s*[(:])"),
     ("isc", r"(?:TOTAL\s+)?I\.?S\.?C\.?"),
     ("icbper", r"(?:TOTAL\s+)?(?:I\.?C\.?B\.?P\.?E\.?R\.?|IMP(?:UESTO)?\.?\s+(?:A\s+LAS\s+)?BOLSAS\s+PL[ÁA]STICAS|BOLSAS?\s+PL[ÁA]STICAS?)"),
     ("redondeo", r"(?:AJUSTE\s+(?:DE|POR)\s+)?REDONDEO"),
@@ -72,16 +74,17 @@ _LABELS = (
         r"(?:MONTO\s+NETO\s+PENDIENTE(?:\s+DE\s+PAGO)?|TOTAL\s+NETO\s+RECIBIDO|(?:IMPORTE|TOTAL)\s+(?:NETO\s+)?A\s+PAGAR|NETO\s+A\s+PAGAR)",
     ),
     # «total» va al final porque «TOTAL» a secas aparece también dentro de otros rótulos.
-    ("total", r"IMPORTE\s+TOTAL|MONTO\s+TOTAL|TOTAL\s+VENTA|TOTAL\s+GENERAL|TOTAL\s+PRESENTE\s+(?:FACTURA|NOTA\s+DE\s+(?:D[EÉ]BITO|CR[EÉ]DITO))|TOTAL"),
+    ("total", r"IMPORTE\s+TOTAL|MONTO\s+TOTAL|TOTAL\s+AMOUNT|TOTAL\s+VENTA|TOTAL\s+GENERAL|TOTAL\s+PRESENTE\s+(?:FACTURA|NOTA\s+DE\s+(?:D[EÉ]BITO|CR[EÉ]DITO))|TOTAL"),
 )
 # Símbolos de moneda que se aceptan. «S7» y «SY» son formas en que el OCR suele leer «S/»,
 # y sólo se admiten si hay un espacio detrás.
-_CURRENCY = r"(?:S/\.?|S[7Y](?=\s)|US\$|PEN|USD|EUR|€|\$)"
+# «Si», «S1» o «S» suelta delante de la cifra son el «S/» mal leído por el OCR (validación del usuario, 2026-11-21).
+_CURRENCY = r"(?:S/\.?|S[7Y](?=\s)|S[iIl1](?=\s+\d)|S'(?=\s*\d)|S(?=\s+\d)|US\$|PEN|USD|EUR|€|\$)"
 # Símbolo -> código de moneda. El «$» a secas se queda como «$» porque no dice si son soles o dólares.
-_CURRENCY_CODES = {"S/": "PEN", "S/.": "PEN", "S7": "PEN", "SY": "PEN", "US$": "USD", "PEN": "PEN", "USD": "USD", "EUR": "EUR", "€": "EUR", "$": "$"}
+_CURRENCY_CODES = {"S/": "PEN", "S/.": "PEN", "S7": "PEN", "SY": "PEN", "SI": "PEN", "SL": "PEN", "S1": "PEN", "S": "PEN", "S'": "PEN", "US$": "USD", "PEN": "PEN", "USD": "USD", "EUR": "EUR", "€": "EUR", "$": "$"}
 # Lo que puede haber entre el rótulo y el número: espacios, dos puntos, corchetes, barras o guiones bajos
 # (restos de las tablas que trae el OCR).
-_SEPARATOR = r"[\s:=\[\]|_]*"
+_SEPARATOR = r"[\s:=\[\]|_—–]*"
 # Un número con miles y decimales, con coma o con punto («1,234.50», «1 234,50», «55»).
 _NUMBER = r"(?:\d{1,3}(?:[,.\u00a0 ]\d{3})+(?:[.,]\d{2})?|\d+(?:[.,]\d{1,2})?)"
 # La expresión que busca, en una línea, «rótulo + porcentaje opcional + moneda + número (con paréntesis opcionales para negativos)».
@@ -100,6 +103,15 @@ _STANDALONE_LABEL_RE = re.compile(
     r"(?:[\s:=(\-]*\d{1,2}(?:(?:[.,]|\s)\d{1,2})?\s*%\s*\)?)?(?:\s+I\.?R\.?)?\s*[:=\[\]|_\-]*\s*(?P<label_curr>" + _CURRENCY + r")?\s*$",
     re.IGNORECASE,
 )
+# Rótulo explícito de operaciones al final de una línea con otro texto (p. ej. una línea de cuentas bancarias que
+# termina en «Total Ope. Gravadas S/»), con el importe en la columna de la derecha. Solo los rótulos de operaciones:
+# «TOTAL» o «IGV» sueltos al final de una frase no cuentan (validación del usuario, 2026-11-21).
+_TRAILING_OPERATION_LABEL_RE = re.compile(
+    r"\s(?:TOTAL\s+)?(?:OPERACIONES|OPER\.?|OPE\.?|OP\.)\s*(?:(?P<no_gravado>NO\s+GRAVAD[AO]S?)|(?P<gravado>GRAVAD[AO]S?)|"
+    r"(?P<inafecto>INAFECT[AO]S?)|(?P<exonerado>EXONERAD[AO]S?)|(?P<gratuitas>GRATUIT[AO]S?))"
+    r"\s*[:=]?\s*(?P<label_curr>" + _CURRENCY + r")?\s*$",
+    re.IGNORECASE,
+)
 _STANDALONE_VALUE_RE = re.compile(
     r"^\s*(?P<sign>[+\-−])?\s*(?P<currency>" + _CURRENCY + r")?\s*[:=\[\]|_]*\s*(?P<open_p>\(\s*)?(?:-\s+)?(?P<value>[+\-−]?" + _NUMBER + r")(?(open_p)\s*\))\s*$",
     re.IGNORECASE,
@@ -110,6 +122,8 @@ _ADDITIONS = ("igv", "isc", "icbper", "otros_tributos", "otros_cargos", "recargo
 # Detracción, retención y percepción: se leen, pero no forman parte del total del comprobante
 # (salvo la retención de 4ta categoría en Recibo por Honorarios, que se descuenta del total por honorarios).
 SETTLEMENT_FIELDS = ("importe_detraccion", "importe_retencion", "importe_percepcion")
+# Tipos que no discriminan IGV: Recibo por Honorarios, recibo por arrendamiento y comprobantes de retención/percepción.
+_NO_IGV_DOCUMENT_TYPES = frozenset({"02", "10", "20", "40"})
 # En estos tres importes la moneda a veces se declara aparte («Moneda: USD»).
 _SETTLEMENT_CURRENCY = re.compile(
     r"\bMONEDA\s*[:=]\s*(PEN|USD|EUR|SOL(?:ES)?|D[ÓO]LAR(?:ES)?)\b", re.IGNORECASE
@@ -137,7 +151,9 @@ def _cifra_dudosa_por_el_simbolo(line: str, match: re.Match[str]) -> bool:
     """
     if (match["currency"] or "") == "$" and match.end("currency") == match.start("value"):
         return True
-    return match["value"] == "7" and bool(_SIGUE_OTRA_CIFRA.match(line[match.end("value"):]))
+    # «S/ 55.00» leído como «57 55.00» o «7 55.00»: la cifra suelta delante de otro número es el símbolo
+    # Un «57.00» o un «S/ 57.00» no tienen esta ambigüedad.
+    return match["value"] in {"7", "57"} and bool(_SIGUE_OTRA_CIFRA.match(line[match.end("value"):]))
 
 
 _NON_TOTAL_PREFIX_RE = re.compile(
@@ -159,6 +175,10 @@ def amount_mentions(line: str):
     for match in _AMOUNT_RE.finditer(line):
         field = next(field for field, _ in _LABELS if match[field] is not None)
         prefix_text = line[: match.start()]
+        # «16V» solo vale como IGV al comienzo de la línea (con ruido de uno o dos caracteres): dentro de una
+        # descripción son voltios («PILA 16V S/ 50.00»).
+        if field == "igv" and re.fullmatch(r"[I1]6V", match["igv"].strip(), re.IGNORECASE) and re.search(r"\w{2,}", prefix_text):
+            continue
         # Evitar falsos «IGV» o «TOTAL» cuando forman parte inmediata de una explicación de retención/detracción
         # o cuando un rótulo de descuento/anticipo/etc. precede inmediatamente a la palabra «TOTAL».
         if field == "igv" and _SPOT_IGV_CONTEXT_RE.search(prefix_text):
@@ -213,7 +233,7 @@ def pair_columnar_amounts(
         # Si la línea ya tiene rótulo + importe juntos, no es un rótulo huérfano.
         if any(amount_mentions(text)):
             continue
-        m_label = _STANDALONE_LABEL_RE.match(text)
+        m_label = _STANDALONE_LABEL_RE.match(text) or _TRAILING_OPERATION_LABEL_RE.search(text)
         if m_label:
             field = next(f for f, _ in _LABELS if m_label[f] is not None)
             lbl_curr = _CURRENCY_CODES.get((m_label["label_curr"] or "").upper())
@@ -269,6 +289,47 @@ def _extract_issue_year(issue_date: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# Diferencia máxima, en la moneda del comprobante, entre el IGV leído y base × tasa.
+IGV_RATE_TOLERANCE = Decimal("0.10")
+# Tasa conjunta especial (IGV + IPM) de restaurantes, hoteles y alojamientos turísticos por año de emisión.
+_SPECIAL_RATE_BY_YEAR = {2022: Decimal("10.0"), 2023: Decimal("10.0"), 2024: Decimal("10.0"), 2025: Decimal("10.0"),
+                         2026: Decimal("10.5"), 2027: Decimal("15.0")}
+_IVAP_RE = re.compile(r"\bIVAP\b|\bARROZ\s+PILADO\b|IMPUESTO\s+A\s+LA\s+VENTA\s+DE\s+ARROZ", re.IGNORECASE)
+
+
+# El régimen rige desde el 1 de septiembre de 2022 (Ley 31556); antes, una tasa del 10 % no tiene sustento.
+_SPECIAL_REGIME_START = "2022-09-01"
+
+
+def _special_rate(year: int) -> Decimal | None:
+    return _SPECIAL_RATE_BY_YEAR.get(year)
+
+
+def special_rate_for_date(issue_date: str | None) -> Decimal | None:
+    """Tasa conjunta especial de restaurantes y hoteles que regía en la fecha de emisión (None si ninguna)."""
+    year = _extract_issue_year(issue_date)
+    if year is None or (issue_date or "") < _SPECIAL_REGIME_START:
+        return None
+    return _special_rate(year)
+
+
+# Tipos en los que el IGV discriminado sostiene el crédito fiscal: si no se pudo comparar la tasa, va a revisión.
+# En la boleta (03) y en otros tipos sin crédito fiscal la falta de desglose es habitual y no se anota.
+IGV_REVIEW_DOCUMENT_TYPES = frozenset({"01", "07", "08", "12", "13", "14"})
+
+
+def _igv_not_compared(status: str, doc_type: str | None, reason: str) -> dict:
+    """Resultado de un control de tasa que no comparó nada: no cuenta como consistente."""
+    return {
+        "check": "igv_rate_check",
+        "status": status,
+        "consistent": None,
+        "needs_review": status == "no_evaluable" and doc_type in IGV_REVIEW_DOCUMENT_TYPES,
+        "effective_rate": None,
+        "reason": reason,
+    }
+
+
 def evaluate_igv_rate(result: ExtractionResult) -> dict:
     """Calcula la tasa efectiva de IGV y la contrasta con tasas legales peruanas vigentes.
 
@@ -278,12 +339,7 @@ def evaluate_igv_rate(result: ExtractionResult) -> dict:
     """
     doc_type = result.document_type
     if doc_type in {"02", "20", "40"}:
-        return {
-            "check": "igv_rate_check",
-            "status": "no_aplica",
-            "consistent": True,
-            "effective_rate": None,
-        }
+        return _igv_not_compared("no_aplica", doc_type, "El tipo de comprobante no discrimina IGV; no se comparó ninguna tasa.")
 
     def _dec(val: str | None) -> Decimal | None:
         if val is None or str(val).strip() == "":
@@ -348,47 +404,39 @@ def evaluate_igv_rate(result: ExtractionResult) -> dict:
                 "consistent": True,
                 "effective_rate": 0.0,
             }
-        return {
-            "check": "igv_rate_check",
-            "status": "no_evaluable",
-            "consistent": True,
-            "effective_rate": None,
-        }
+        return _igv_not_compared("no_evaluable", doc_type, "No se leyó una base gravada; la tasa de IGV no se pudo comparar.")
 
     if igv is None:
-        return {
-            "check": "igv_rate_check",
-            "status": "no_evaluable",
-            "consistent": True,
-            "effective_rate": None,
-        }
+        return _igv_not_compared("no_evaluable", doc_type, "No se leyó el IGV; la tasa no se pudo comparar.")
 
     igv_abs = abs(igv)
     effective_rate = (igv_abs / base_grav) * Decimal("100")
     effective_rounded = float(round(effective_rate, 2))
 
-    # Tasas conjuntas (IGV + IPM) vigentes:
+    # Tasas conjuntas (IGV + IPM) que el control reconoce:
     # - 18 % régimen general (cambia la composición interna IGV/IPM por Ley 32387, pero siempre suma 18 %).
-    # - 4 % IVAP.
+    # - 4 % IVAP, solo si el documento menciona IVAP o arroz pilado.
     # - Tasa especial para restaurantes, hoteles y alojamientos turísticos (Ley 31556 / Ley 32219 + IPM Ley 32387;
-    #   no aplica a cualquier MYPE ni a catering/concesionarios): 10 % hasta 2025 (8+2), 10.5 % en 2026 (8+2.5) y 15 % en 2027 (12+3).
+    #   no aplica a cualquier MYPE ni a catering/concesionarios): 10 % de 2022 a 2025 (8+2), 10.5 % en 2026 (8+2.5)
+    #   y 15 % en 2027 (12+3), desde el 1 de septiembre de 2022. Aquí no se conoce el giro del emisor, así que una
+    #   tasa especial nunca es «tasa_valida»: queda como «tasa_especial_verificar». Con la consulta RUC cargada,
+    #   ciiu.refine_special_rate_check la decide por el CIIU del emisor.
+    #   Las notas de crédito o débito admiten, además, la tasa especial del año anterior (pueden modificar
+    #   comprobantes emitidos ese año), no más atrás.
+    #   Sin fecha legible no se sabe qué tasa especial regía: cualquiera de ellas queda para verificar.
     year = _extract_issue_year(result.issue_date)
-    allowed_rates: list[Decimal] = [Decimal("18.0"), Decimal("4.0")]
+    general_rates = [Decimal("18.0")]
+    has_ivap = bool(_IVAP_RE.search(result.extracted_text or ""))
+    if has_ivap:
+        general_rates.append(Decimal("4.0"))
     if year is None:
-        allowed_rates.extend([Decimal("10.0"), Decimal("10.5"), Decimal("15.0")])
-    elif year <= 2025:
-        allowed_rates.append(Decimal("10.0"))
-    elif year == 2026:
-        allowed_rates.append(Decimal("10.5"))
-        if doc_type in {"07", "08"}:
-            allowed_rates.append(Decimal("10.0"))
-    elif year == 2027:
-        allowed_rates.append(Decimal("15.0"))
-        if doc_type in {"07", "08"}:
-            allowed_rates.extend([Decimal("10.5"), Decimal("10.0")])
+        special_rates = sorted(set(_SPECIAL_RATE_BY_YEAR.values()))
     else:
+        special_rates = [r for r in (special_rate_for_date(result.issue_date),) if r is not None]
         if doc_type in {"07", "08"}:
-            allowed_rates.extend([Decimal("15.0"), Decimal("10.5"), Decimal("10.0")])
+            prior = _special_rate(year - 1) if year - 1 >= 2022 else None
+            if prior is not None and prior not in special_rates:
+                special_rates.append(prior)
 
     # También considerar caso en que el ISC forma parte de la base del IGV (IGV = tasa * (base + isc))
     isc_val = abs(_dec(result.isc) or Decimal("0"))
@@ -396,34 +444,55 @@ def evaluate_igv_rate(result: ExtractionResult) -> dict:
     if isc_val > 0:
         candidate_bases.append(base_grav + isc_val)
 
+    # Tolerancia absoluta: cubre el redondeo por línea, no crece con la base (antes era 0.2 % de la base).
     best_match: tuple[Decimal, Decimal, Decimal] | None = None
     for b in candidate_bases:
-        tol_amount = max(Decimal("0.03"), b * Decimal("0.002"))
-        for rate in allowed_rates:
+        for rate in (*general_rates, *special_rates):
             expected_igv = b * rate / Decimal("100")
             diff = abs(igv_abs - expected_igv)
-            if diff <= tol_amount:
+            if diff <= IGV_RATE_TOLERANCE:
                 if best_match is None or diff < best_match[0]:
                     best_match = (diff, rate, b)
 
     if best_match is not None:
         _, matched_rate, matched_base = best_match
         eff_vs_b = float(round((igv_abs / matched_base) * Decimal("100"), 2))
+        if matched_rate in general_rates:
+            return {
+                "check": "igv_rate_check",
+                "status": "tasa_valida",
+                "consistent": True,
+                "needs_review": False,
+                "effective_rate": eff_vs_b,
+                "matched_rate": float(matched_rate),
+            }
+        when = f"en {year}" if year is not None else "sin fecha de emisión legible"
         return {
             "check": "igv_rate_check",
-            "status": "tasa_valida",
-            "consistent": True,
+            "status": "tasa_especial_verificar",
+            "consistent": None,
+            "needs_review": True,
             "effective_rate": eff_vs_b,
             "matched_rate": float(matched_rate),
+            "reason": (
+                f"Tasa de {matched_rate:g}% {when}: corresponde al régimen especial de restaurantes, hoteles y "
+                "alojamientos turísticos. El programa no conoce el giro del emisor; verifique que califica."
+            ),
         }
 
-    rates_str = ", ".join(f"{r:g}%" for r in sorted(set(allowed_rates), reverse=True))
+    expected = sorted({*general_rates, *special_rates}, reverse=True)
+    rates_str = ", ".join(f"{r:g}%" for r in expected)
+    ivap_note = "" if has_ivap else " El 4 % solo se acepta si el documento menciona IVAP o arroz pilado."
     return {
         "check": "igv_rate_check",
         "status": "tasa_igv_atipica",
         "consistent": False,
+        "needs_review": True,
         "effective_rate": effective_rounded,
-        "reason": f"Tasa efectiva de IGV ({effective_rounded:.2f}%) fuera de tasas legales esperadas ({rates_str}). Verifique base gravada, IGV o régimen aplicable.",
+        "reason": (
+            f"Tasa efectiva de IGV ({effective_rounded:.2f}%) fuera de las tasas esperadas ({rates_str}). "
+            f"Verifique base gravada, IGV o régimen aplicable.{ivap_note}"
+        ),
     }
 
 
@@ -519,11 +588,12 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
                 "difference": "0.00",
                 "reason": note,
             }
-        # Nota de Crédito Tipo 13 (ajuste de fechas/montos de cuotas con importe 0.00)
+        # Nota de Crédito Tipo 13 (ajuste de fechas/montos de cuotas con importe 0.00).
+        # Hace falta el código 13 o la leyenda del ajuste: la palabra «cuota» sola aparece en casi
+        # cualquier comprobante al crédito y no explica un total cero.
         if result.document_type == "07" and (
             result.note_type_code == "13"
-            or result.installments_count is not None
-            or re.search(r"\bCUOTA\b|\bTIPO\s+13\b|\bAJUSTE\s+DE\s+(?:FECHAS|CUOTAS)\b", result.extracted_text or "", re.I)
+            or re.search(r"\bTIPO\s*(?:DE\s+NOTA\s*)?:?\s*13\b|\bAJUSTE\s+DE\s+(?:FECHAS|CUOTAS|MONTOS)\b", result.extracted_text or "", re.I)
         ):
             return {
                 **check,
@@ -541,7 +611,6 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
     # Paso 5: casos de coexistencia no gravado/inafecto o recargo FISE/inafecto.
     discount = abs(values.get("descuentos", Decimal(0)))
     anticipos_val = abs(values.get("anticipos", Decimal(0)))
-    fise_inside_inafecto = False
     if values.get("no_gravado") and (values.get("inafecto") or values.get("exonerado")):
         sub_sum = values.get("inafecto", Decimal(0)) + values.get("exonerado", Decimal(0))
         if values["no_gravado"] == sub_sum:
@@ -559,22 +628,36 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
     after_discount = subtotal if subtotal is None or net_subtotal else subtotal - discount
     additions_sum = sum((values[field] for field in _ADDITIONS if field in values), Decimal(0))
 
-    # Paso 7: elegimos la base contra la que se cuadra.
+    # Paso 7: elegimos la base contra la que se cuadra. Las comparaciones entre subtotal, valor de venta y bases
+    # usan la misma tolerancia que el total: un céntimo de redondeo no deja el
+    # cuadre en «datos insuficientes», sino en «cuadra_con_redondeo» con el motivo.
+    def _close(a: Decimal | None, b: Decimal | None) -> bool:
+        return a is not None and b is not None and abs(a - b) <= tol
+
+    component_notes: list[str] = []
     if bases:
         base = sum(bases.values(), Decimal(0))
         if sale_value is not None and sale_value != base:
-            return {**check, "reason": "El valor de venta no coincide con el desglose de bases leído."}
-        if subtotal is not None and subtotal not in {base, base + discount, base + anticipos_val, base + discount + anticipos_val}:
-            return {**check, "reason": "El subtotal no coincide con el desglose de bases leído."}
+            if not _close(sale_value, base):
+                return {**check, "reason": "El valor de venta no coincide con el desglose de bases leído."}
+            component_notes.append(f"Valor de venta y bases difieren por redondeo ({sale_value - base:+.2f}).")
+        subtotal_targets = (base, base + discount, base + anticipos_val, base + discount + anticipos_val)
+        if subtotal is not None and subtotal not in subtotal_targets:
+            near = next((t for t in subtotal_targets if _close(subtotal, t)), None)
+            if near is None:
+                return {**check, "reason": "El subtotal no coincide con el desglose de bases leído."}
+            component_notes.append(f"Subtotal y bases difieren por redondeo ({subtotal - near:+.2f}).")
         # Si existe descuento sin subtotal bruto ni valor_venta, aceptamos solo si el total concuerda con bases netas o brutas menos descuento.
         if discount and subtotal is None and sale_value is None:
             if abs((base + additions_sum) - observed) > tol and abs((base - discount + additions_sum) - observed) <= tol:
                 base = base - discount
-        elif discount and subtotal is not None and subtotal != base and after_discount != base and sale_value != base:
+        elif discount and subtotal is not None and not _close(subtotal, base) and not _close(after_discount, base) and not _close(sale_value, base):
             return {**check, "reason": "El documento no permite distinguir si las bases ya incluyen el descuento."}
     elif sale_value is not None:
-        if after_discount is not None and sale_value != after_discount and sale_value != subtotal:
+        if after_discount is not None and not _close(sale_value, after_discount) and not _close(sale_value, subtotal):
             return {**check, "reason": "El valor de venta difiere del subtotal después de descuentos."}
+        if after_discount is not None and sale_value not in {after_discount, subtotal}:
+            component_notes.append("Valor de venta y subtotal difieren por redondeo.")
         base = sale_value
     else:
         if discount and subtotal is not None and abs((subtotal + additions_sum) - observed) <= tol:
@@ -591,7 +674,6 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
         without_fise = expected - values["recargo_fise"]
         if abs(expected - observed) > tol and abs(without_fise - observed) <= tol:
             expected = without_fise
-            fise_inside_inafecto = True
             extra_notes.append("Recargo FISE incluido en operaciones inafectas.")
         elif abs(expected - observed) > tol:
             return {**check, "reason": "El recargo FISE puede estar incluido en el total de operaciones inafectas."}
@@ -619,25 +701,24 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
             expected = expected - det_val
             extra_notes.append("Neto a pagar deduce detracción.")
 
-    # Caso Notas de Crédito (07) impresas con signos mixtos (p. ej. bases positivas/negativas con IGV positivo y total negativo)
+    # Caso Notas de Crédito (07): se admite solo la convención coherente de signos, en la que todos los
+    # componentes tienen el mismo signo y el total se imprime con el signo contrario (p. ej. bases e IGV
+    # positivos y total negativo). Si los componentes tienen signos mezclados no se cuadra con valores
+    # absolutos: eso hacía sumar 100 − 18 como si fuera 118.
     effective_observed = observed
     if result.document_type == "07":
-        all_signed = [*bases.values(), *(values[f] for f in _ADDITIONS if f in values), observed]
-        if any(v > 0 for v in all_signed) and any(v < 0 for v in all_signed):
-            if observed < 0 and expected > 0:
+        components = [*bases.values(), *(values[f] for f in _ADDITIONS if f in values)]
+        if sale_value is not None and not bases:
+            components.append(sale_value)
+        if components and observed != 0:
+            all_non_negative = all(v >= 0 for v in components)
+            all_non_positive = all(v <= 0 for v in components)
+            if all_non_negative and observed < 0 and expected > 0:
                 effective_observed = abs(observed)
-                extra_notes.append("Nota de crédito con signos mixtos (bases positivas y total negativo).")
-            elif abs(expected - observed) > tol:
-                abs_base = sum((abs(v) for v in bases.values()), Decimal(0))
-                if abs_base == 0 and sale_value is not None:
-                    abs_base = abs(sale_value)
-                abs_add = sum((abs(values[f]) for f in _ADDITIONS if f in values), Decimal(0))
-                for cand_exp in (abs_base + abs_add - abs(discount) - abs(anticipos_val), abs_base + abs_add):
-                    if abs(cand_exp - abs(observed)) <= tol:
-                        expected = cand_exp
-                        effective_observed = abs(observed)
-                        extra_notes.append("Nota de crédito con signos mixtos en bases, IGV o total.")
-                        break
+                extra_notes.append("Nota de crédito con bases e impuestos positivos y total impreso en negativo.")
+            elif all_non_positive and observed > 0 and expected < 0:
+                effective_observed = -observed
+                extra_notes.append("Nota de crédito con bases e impuestos negativos y total impreso en positivo.")
 
     difference = expected - effective_observed
     exact = difference == 0
@@ -654,4 +735,20 @@ def reconcile_amounts(result: ExtractionResult, *, rounding_tolerance: Decimal |
         res_check["reason"] = " ".join(extra_notes)
     elif rounded_ok:
         res_check["reason"] = f"Cuadra dentro de tolerancia de redondeo ({difference:+.2f})."
+    if component_notes and res_check["consistent"]:
+        res_check["status"] = "cuadra_con_redondeo"
+        res_check["reason"] = " ".join([*component_notes, *([res_check["reason"]] if res_check.get("reason") else [])])
+
+    # Un cuadre sin IGV en un comprobante con base gravada (o sin desglose alguno) solo dice que los
+    # números no se contradicen: no comprobó el impuesto. Se informa como «no_contradice» y va a revisión
+    # Las bases exoneradas, inafectas o de exportación sí cuadran sin IGV.
+    if res_check["consistent"] and result.document_type not in _NO_IGV_DOCUMENT_TYPES and "igv" not in values:
+        non_taxable = any(values.get(f) for f in ("inafecto", "exonerado", "exportaciones", "no_gravado"))
+        if not non_taxable:
+            res_check["status"] = "no_contradice"
+            res_check["consistent"] = None
+            res_check["reason"] = (
+                "Los importes leídos no se contradicen, pero no se leyó el IGV: el cuadre no se pudo comprobar. "
+                "Verifique en el original la base, el IGV y el total."
+            )
     return res_check

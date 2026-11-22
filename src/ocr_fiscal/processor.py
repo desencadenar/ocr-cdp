@@ -12,8 +12,11 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .amount_panel import review_amount_panel
 from .archives import ContainerWalker, WorkUnit
+from .ciiu import ConsultaRucReport, load_consulta_ruc, refine_special_rate_check
 from .config import AppConfig
-from .documents import read_work_unit, reocr_line_bbox
+from . import documents as _documents
+from .documents import DocumentReadError, read_work_unit, reocr_line_bbox
+from .reading_cache import CACHE_FILENAME, ReadingCache, reread_key, unit_key
 from .extraction import parse_document
 from .models import (
     AMBIGUOUS,
@@ -25,7 +28,6 @@ from .models import (
     READ_ERROR,
     ArchiveSummary,
     ExtractionResult,
-    FieldEvidence,
     StageEvent,
 )
 from .ocr import OCREngine, TesseractOCREngine
@@ -150,6 +152,7 @@ class ScanSummary:
     stage_timings_ms: dict[str, float] = field(default_factory=dict)
     archive_summaries: list[ArchiveSummary] = field(default_factory=list)
     padron_summary: dict[str, Any] = field(default_factory=dict)
+    consulta_ruc_summary: dict[str, Any] = field(default_factory=dict)
     reconciliation_summary: dict[str, Any] = field(default_factory=dict)
 
     # Cuántos documentos hay de cada estado de detección.
@@ -250,6 +253,7 @@ class ScanSummary:
                 for item in self.outcomes
             ],
             "padron_summary": dict(self.padron_summary),
+            "consulta_ruc_summary": dict(self.consulta_ruc_summary),
             "reconciliation_summary": dict(self.reconciliation_summary),
         }
 
@@ -291,10 +295,33 @@ def _parse_sunat_qr_payload(raw_qr: str) -> dict[str, str] | None:
     }
 
 
-def _crosscheck_sunat_qr(result: ExtractionResult, pages: Sequence[Any]) -> None:
-    """Coteja lo extraído visualmente contra el código QR SUNAT de las páginas del comprobante (si existe)."""
+def _qr_amount(raw: str) -> Decimal:
+    """Importe del QR. El estándar usa punto decimal; se acepta también «18,00» (coma y dos decimales)."""
+    value = raw.strip()
+    if re.fullmatch(r"-?\d+,\d{1,2}", value):
+        value = value.replace(",", ".")
+    return Decimal(value.replace(",", ""))
+
+
+def _crosscheck_sunat_qr(
+    result: ExtractionResult,
+    pages: Sequence[Any],
+    *,
+    qr_decoder_available: bool | None = None,
+) -> None:
+    """Coteja lo extraído visualmente contra el código QR SUNAT de las páginas del comprobante (si existe).
+
+    Estados:
+    - `coincide`: se compararon al menos RUC emisor, serie y total, y no hay diferencias.
+    - `coincide_parcial`: no hay diferencias, pero faltó comparar alguno de esos tres campos.
+    - `difiere`: algún campo comparado no coincide.
+    - `qr_no_vinculado`: hay QR en la página, pero ninguno coincide en serie ni RUC emisor con lo leído.
+    - `sin_qr`: se buscó y no hay QR; `qr_no_ejecutado`: no se buscó porque falta `zxingcpp`.
+    """
     if not result.comprobante_detectado:
         return
+    if qr_decoder_available is None:
+        qr_decoder_available = _documents.QR_DECODER_AVAILABLE
     qr_entries: list[dict[str, str]] = []
     for p in pages:
         pno = getattr(p, "page_number", 1)
@@ -306,20 +333,41 @@ def _crosscheck_sunat_qr(result: ExtractionResult, pages: Sequence[Any]) -> None
                 qr_entries.append(parsed)
 
     if not qr_entries:
-        result.derived_checks.append(
-            {"check": "sunat_qr_crosscheck", "status": "sin_qr", "consistent": None}
-        )
+        if qr_decoder_available:
+            result.derived_checks.append({"check": "sunat_qr_crosscheck", "status": "sin_qr", "consistent": None})
+        else:
+            result.derived_checks.append({
+                "check": "sunat_qr_crosscheck",
+                "status": "qr_no_ejecutado",
+                "consistent": None,
+                "reason": "No está instalado zxingcpp: el código QR no se buscó ni se cotejó.",
+            })
         return
 
-    # Si hay más de un QR en el rango de páginas, priorizamos el que coincida en serie o RUC emisor.
+    # Se usa el QR que coincida en serie o RUC emisor con lo leído. Si ninguno coincide, no se toma
+    # el primero de la página: puede ser de otro documento.
     qr = next(
         (
             entry for entry in qr_entries
             if (result.series and entry["series"] == result.series.upper())
             or (result.emitter_ruc and entry["emitter_ruc"] == result.emitter_ruc)
         ),
-        qr_entries[0],
+        None,
     )
+    if qr is None:
+        result.derived_checks.append({
+            "check": "sunat_qr_crosscheck",
+            "status": "qr_no_vinculado",
+            "consistent": None,
+            "qr_summary": "; ".join(
+                f"{e['emitter_ruc']}-{e['document_type']}-{e['series']}-{e['correlativo_normalized']}" for e in qr_entries
+            ),
+            "reason": "Hay código QR en la página, pero ninguno coincide en serie ni en RUC emisor con lo leído del texto.",
+        })
+        result.observations.append("código QR en la página sin vínculo con la serie ni el RUC emisor leídos")
+        if "qr_crosscheck" not in result.secondary_review_fields:
+            result.secondary_review_fields.append("qr_crosscheck")
+        return
     discrepancies: list[str] = []
 
     if result.emitter_ruc and qr["emitter_ruc"] != result.emitter_ruc:
@@ -334,29 +382,43 @@ def _crosscheck_sunat_qr(result: ExtractionResult, pages: Sequence[Any]) -> None
         discrepancies.append(f"fecha(texto={result.issue_date} vs qr={qr['issue_date']})")
     if result.igv and qr["igv"]:
         try:
-            if abs(Decimal(result.igv) - Decimal(qr["igv"].replace(",", ""))) > Decimal("0.02"):
+            if abs(Decimal(result.igv) - _qr_amount(qr["igv"])) > Decimal("0.02"):
                 discrepancies.append(f"igv(texto={result.igv} vs qr={qr['igv']})")
         except InvalidOperation:
             pass
     if result.total and qr["total"]:
         try:
-            if abs(Decimal(result.total) - Decimal(qr["total"].replace(",", ""))) > Decimal("0.02"):
+            if abs(Decimal(result.total) - _qr_amount(qr["total"])) > Decimal("0.02"):
                 discrepancies.append(f"total(texto={result.total} vs qr={qr['total']})")
         except InvalidOperation:
             pass
     if result.recipient_ruc and qr["recipient_ruc"] and len(qr["recipient_ruc"]) == 11 and qr["recipient_ruc"] != result.recipient_ruc:
         discrepancies.append(f"ruc_receptor(texto={result.recipient_ruc} vs qr={qr['recipient_ruc']})")
 
-    status = "difiere" if discrepancies else "coincide"
-    result.derived_checks.append(
-        {
-            "check": "sunat_qr_crosscheck",
-            "status": status,
-            "consistent": not discrepancies,
-            "discrepancies": discrepancies,
-            "qr_summary": f"{qr['emitter_ruc']}-{qr['document_type']}-{qr['series']}-{qr['correlativo_normalized']} (IGV={qr['igv']}, Total={qr['total']})",
-        }
-    )
+    not_compared = [
+        label for label, text_value, qr_value in (
+            ("ruc_emisor", result.emitter_ruc, qr["emitter_ruc"]),
+            ("serie", result.series, qr["series"]),
+            ("total", result.total, qr["total"]),
+        )
+        if not (text_value and qr_value)
+    ]
+    if discrepancies:
+        status, consistent = "difiere", False
+    elif not_compared:
+        status, consistent = "coincide_parcial", None
+    else:
+        status, consistent = "coincide", True
+    qr_check = {
+        "check": "sunat_qr_crosscheck",
+        "status": status,
+        "consistent": consistent,
+        "discrepancies": discrepancies,
+        "qr_summary": f"{qr['emitter_ruc']}-{qr['document_type']}-{qr['series']}-{qr['correlativo_normalized']} (IGV={qr['igv']}, Total={qr['total']})",
+    }
+    if status == "coincide_parcial":
+        qr_check["reason"] = f"Sin diferencias, pero no se pudo comparar: {', '.join(not_compared)}."
+    result.derived_checks.append(qr_check)
     if discrepancies:
         result.observations.append(f"cotejo QR SUNAT difiere: {', '.join(discrepancies)}")
         if "qr_crosscheck" not in result.secondary_review_fields:
@@ -369,10 +431,15 @@ def _surgical_line_reocr(
     results: Sequence[ExtractionResult],
     config: AppConfig,
     engine: OCREngine,
+    reread_fn: Callable[[int, Any, int], str | None] | None = None,
 ) -> list[StageEvent]:
-    """Relee con `--psm 7` solo las líneas puntuales que tuvieron error de dígito verificador o duda O/0."""
+    """Relee con `--psm 7` solo las líneas puntuales que tuvieron error de dígito verificador o duda O/0.
+
+    `reread_fn(página, bbox, rotación)` sustituye a Tesseract: graba las relecturas en la lectura guardada o las
+    toma de ella en `redetectar`.
+    """
     events: list[StageEvent] = []
-    if not isinstance(engine, TesseractOCREngine):
+    if reread_fn is None and not isinstance(engine, TesseractOCREngine):
         return events
     page_map = {getattr(p, "page_number", 1): p for p in pages}
 
@@ -391,7 +458,10 @@ def _surgical_line_reocr(
         for fname, ev in targets[:3]:
             page = page_map.get(ev.page_number)
             rot_angle = int((getattr(page, "quality", {}) or {}).get("rotation_angle", 0)) if page else 0
-            reread = reocr_line_bbox(unit, ev.page_number, ev.bbox, config, engine, rotation_angle=rot_angle)
+            if reread_fn is not None:
+                reread = reread_fn(ev.page_number, ev.bbox, rot_angle)
+            else:
+                reread = reocr_line_bbox(unit, ev.page_number, ev.bbox, config, engine, rotation_angle=rot_angle)
             if not reread:
                 continue
             events.append(
@@ -422,6 +492,41 @@ def _surgical_line_reocr(
 
 # El orquestador: junta todas las piezas (recorrer carpetas, leer, extraer, guardar y reconciliar).
 # Una corrida corresponde a una carpeta de salida nueva.
+
+def _apply_emitter_activity(item: "DocumentOutcome", consulta: ConsultaRucReport) -> None:
+    """Anota el CIIU del emisor y, si la tasa especial estaba por verificar, la decide con él."""
+    if item.detection_status != DETECTED:
+        return
+    em_ruc = str(item.fields.get("emitter_ruc") or item.fields_original.get("emitter_ruc") or "").strip()
+    act = consulta.activities.get(em_ruc)
+    if act is not None:
+        item.derived_checks = [c for c in item.derived_checks if c.get("check") != "emitter_ciiu"]
+        item.derived_checks.append({
+            "check": "emitter_ciiu", "ruc": act.ruc, "principal": act.principal, "secondary": list(act.secondary),
+            "estado": act.estado, "inicio_actividades": act.inicio_actividades, "source": act.source,
+            "query_date": act.query_date, "label": act.label(),
+        })
+    for idx, chk in enumerate(item.derived_checks):
+        if chk.get("check") != "igv_rate_check" or chk.get("status") != "tasa_especial_verificar":
+            continue
+        issue_date = item.fields.get("issue_date") or item.fields_original.get("issue_date")
+        doc_type = item.fields.get("document_type") or item.fields_original.get("document_type")
+        # Decisión del usuario (2026-11-20): con un CIIU Rev. 3 mixto deciden las descripciones del comprobante.
+        item_texts = [str(li.get("description_normalized") or li.get("description_observed") or "") for li in item.line_items]
+        descriptions = " | ".join(t for t in [item.general_description or "", *item_texts] if t)
+        new = refine_special_rate_check(chk, act, issue_date=issue_date, document_type=doc_type, descriptions=descriptions)
+        if new is chk:
+            continue
+        item.derived_checks[idx] = new
+        if chk.get("reason") in item.observations:
+            item.observations.remove(chk["reason"])
+        item.observations.append(new["reason"])
+        if new.get("status") == "tasa_especial_valida":
+            if "igv_rate" in item.secondary_review_fields:
+                item.secondary_review_fields.remove("igv_rate")
+            # Mismo criterio que extraction.parse_document para «requiere revisión humana».
+            item.requires_human_review = item.identity_status != IDENTITY_COMPLETE or bool(item.secondary_review_fields)
+
 class FiscalProcessor:
     # Prepara la carpeta de salida (tiene que estar vacía o no existir), crea la base de estado
     # y guarda los datos de la corrida.
@@ -430,6 +535,8 @@ class FiscalProcessor:
         output_root: str | Path,
         config: AppConfig | None = None,
         engine: OCREngine | None = None,
+        *,
+        replay_readings: str | Path | None = None,
     ) -> None:
         self.output_root = Path(output_root).resolve()
         self.config = config or AppConfig()
@@ -449,7 +556,25 @@ class FiscalProcessor:
         self._scan_started = threading.Event()
         self._scan_lock = threading.Lock()
         self.store = StateStore(self.state_dir / "state.sqlite3")
+        # Lecturas guardadas: se graban si el ajuste lo pide; con replay_readings se leen de
+        # una corrida anterior en lugar de pasar por Tesseract.
+        self.replay = ReadingCache(replay_readings, readonly=True) if replay_readings is not None else None
+        self.reading_cache = ReadingCache(self.state_dir / CACHE_FILENAME) if self.config.keep_full_reading else None
         self._store_effective_run_metadata()
+
+    # Borra .ocr_fiscal/ (state.sqlite3) cuando el usuario pidió no conservar el estado. Se llama después de
+    # escribir el Excel; sin el estado, el comando export ya no puede regenerarlo.
+    def discard_state(self) -> None:
+        import shutil
+
+        self.close_readings()
+        shutil.rmtree(self.state_dir, ignore_errors=False)
+
+    def close_readings(self) -> None:
+        for cache in (self.reading_cache, self.replay):
+            if cache is not None:
+                cache.close()
+        self.reading_cache = self.replay = None
 
     # Guarda los datos de la corrida: RUC del comprador, ajustes de lectura y, al terminar, los contadores finales.
     def _store_effective_run_metadata(self, summary: ScanSummary | None = None) -> None:
@@ -467,6 +592,10 @@ class FiscalProcessor:
             "releer_recuadro_importes": self.config.read_amount_panel,
             "exportar_pdf_ordenado": self.config.export_pdf_folders,
             "padron_ruc": str(self.config.padron_db_path) if self.config.padron_db_path else None,
+            "consulta_ruc": str(self.config.consulta_ruc_path) if self.config.consulta_ruc_path else None,
+            "guardar_lectura_completa": self.config.keep_full_reading,
+            "redetectada_desde": str(self.replay.path) if self.replay is not None else None,
+            "input_root": str(getattr(self, "_input_root", "")) or None,
         }
         if summary is not None:
             metadata.update(
@@ -481,6 +610,7 @@ class FiscalProcessor:
                     "excluded_xml_count": summary.excluded_xml_count,
                     "ignored_unsupported_count": summary.ignored_unsupported_count,
                     "padron_summary": dict(summary.padron_summary),
+                    "consulta_ruc_summary": dict(summary.consulta_ruc_summary),
                     "reconciliation_summary": dict(summary.reconciliation_summary),
                 }
             )
@@ -639,6 +769,18 @@ class FiscalProcessor:
             "invalid_ruc_count": padron_report.invalid_ruc_count,
             "reason": padron_report.reason,
         }
+
+        # Paso 2b: con la consulta RUC (si la hay), el CIIU del emisor decide la tasa especial de IGV.
+        consulta = load_consulta_ruc(self.config.consulta_ruc_path) if self.config.consulta_ruc_path else None
+        if consulta is not None:
+            summary.consulta_ruc_summary = {
+                "path": consulta.path,
+                "query_date": consulta.query_date,
+                "ruc_count": len(consulta.activities),
+                "rejected_rows": consulta.rejected_rows,
+            }
+            for item in summary.outcomes:
+                _apply_emitter_activity(item, consulta)
 
         # El padrón local se usa para validar existencia del RUC en la instantánea y cotejar razones sociales.
         for item in summary.outcomes:
@@ -984,7 +1126,34 @@ class FiscalProcessor:
         unit_started = time.perf_counter()
         read_t0 = time.perf_counter()
         try:
-            read_result = read_work_unit(unit, self.engine, self.config)
+            key: str | None = None
+            rereads: dict[str, str | None] = {}
+            if self.replay is not None or self.reading_cache is not None:
+                content = unit.read_bytes()
+                if content is None and unit.disk_path is not None:
+                    content = unit.disk_path.read_bytes()
+                key = unit_key(content, self.config) if content is not None else None
+            if self.replay is not None:
+                cached = self.replay.get(key) if key else None
+                if cached is None:
+                    raise DocumentReadError(
+                        "lectura no guardada: el documento no figura en las lecturas de la corrida de origen "
+                        "(nuevo, modificado o leído con otros ajustes). Vuelva a correr scan para leerlo."
+                    )
+                read_result, saved = cached
+
+                def reread_fn(page_number: int, bbox: Any, rotation: int) -> str | None:
+                    value = saved.get(reread_key(page_number, bbox))
+                    rereads[reread_key(page_number, bbox)] = value
+                    return value
+            else:
+                read_result = read_work_unit(unit, self.engine, self.config)
+                reread_fn = None
+                if self.reading_cache is not None and isinstance(self.engine, TesseractOCREngine):
+                    def reread_fn(page_number: int, bbox: Any, rotation: int) -> str | None:
+                        value = reocr_line_bbox(unit, page_number, bbox, self.config, self.engine, rotation_angle=rotation)
+                        rereads[reread_key(page_number, bbox)] = value
+                        return value
             read_ms = (time.perf_counter() - read_t0) * 1000.0
             rotations = {
                 getattr(p, "page_number", 1): int((getattr(p, "quality", {}) or {}).get("rotation_angle", 0))
@@ -1003,7 +1172,8 @@ class FiscalProcessor:
             events = list(read_result.events)
 
             if (
-                self.config.read_amount_panel and read_result.source_format == "pdf"
+                self.replay is None
+                and self.config.read_amount_panel and read_result.source_format == "pdf"
                 and len(results) == 1
                 and results[0].comprobante_detectado and results[0].document_type in {"01", "03", "07", "08"}
             ):
@@ -1016,7 +1186,9 @@ class FiscalProcessor:
                     if panel_event is not None:
                         events.append(panel_event)
 
-            events.extend(_surgical_line_reocr(unit, read_result.pages, results, self.config, self.engine))
+            events.extend(_surgical_line_reocr(unit, read_result.pages, results, self.config, self.engine, reread_fn))
+            if self.reading_cache is not None and key:
+                self.reading_cache.put(key, read_result, rereads)
             for item_res in results:
                 _crosscheck_sunat_qr(item_res, read_result.pages)
 
@@ -1051,6 +1223,7 @@ class FiscalProcessor:
         root = Path(input_root).resolve()
         if not root.is_dir():
             raise ValueError(f"La carpeta de entrada no existe: {root}")
+        self._input_root = root
 
         if root == self.output_root:
             raise ValueError("La carpeta de salida debe ser distinta de la carpeta de entrada.")
@@ -1307,6 +1480,10 @@ class FiscalProcessor:
         stage_timings_ms["reconciliation_and_validation"] = (time.perf_counter() - reconcile_t0) * 1000.0
 
         self.store.store_archive_summaries(walk_result.archive_summaries)
+        if walk_result.spool_dir is not None:
+            import shutil
+
+            shutil.rmtree(walk_result.spool_dir, ignore_errors=True)
         summary.stage_timings_ms = stage_timings_ms
         self._store_effective_run_metadata(summary)
 
