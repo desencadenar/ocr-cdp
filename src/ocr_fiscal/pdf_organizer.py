@@ -99,7 +99,7 @@ def _write_pdf_subset(
     shares_physical_page: bool = False,
 ) -> tuple[bool, str | None]:
     """Copia un PDF entero intacto o extrae su rango de páginas exacto con PyMuPDF."""
-    raw_bytes = unit.content_bytes
+    raw_bytes = unit.read_bytes()
     src_pdf = pymupdf.open(stream=raw_bytes, filetype="pdf") if raw_bytes is not None else pymupdf.open(unit.disk_path)
     with src_pdf:
         p1 = max(1, min(page_start, src_pdf.page_count))
@@ -130,7 +130,7 @@ def _build_images_pdf_bytes(
     max_side_px: int | None = None,
 ) -> tuple[bytes, int]:
     """Construye los bytes de un PDF a partir de una imagen (o TIFF multipágina)."""
-    raw_bytes = unit.content_bytes
+    raw_bytes = unit.read_bytes()
     img = Image.open(io.BytesIO(raw_bytes)) if raw_bytes is not None else Image.open(unit.disk_path)
     out_pdf = pymupdf.open()
     exported_pages = 0
@@ -206,7 +206,7 @@ def _write_pdf_pages_list(
 ) -> int:
     """Extrae uno o varios rangos de páginas de un PDF y los une en `dest`."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    raw_bytes = unit.content_bytes
+    raw_bytes = unit.read_bytes()
     src_pdf = pymupdf.open(stream=raw_bytes, filetype="pdf") if raw_bytes is not None else pymupdf.open(unit.disk_path)
     out_pdf = pymupdf.open()
     exported_pages = 0
@@ -282,10 +282,11 @@ def _set_pdf_derived_info(
 
 def _has_blocking_expediente_issue(item: Any, target_recipient_ruc: str | None) -> tuple[bool, str | None]:
     """Determina si un CDP completo NO debe ingresar a `01_cdp_por_proveedor/` por riesgo directo de reparo."""
-    if item.recipient_role_status == "mismatch":
-        return True, "TERCERO_"
+    # La venta propia va primero: en una venta propia el receptor siempre es «otro».
     if target_recipient_ruc and str(item.fields.get("emitter_ruc") or "").strip() == target_recipient_ruc:
         return True, "VENTA_PROPIA_"
+    if item.recipient_role_status == "mismatch":
+        return True, "TERCERO_"
     if any(
         chk.get("check") == "sunat_qr_crosscheck" and chk.get("status") == "difiere"
         for chk in (getattr(item, "derived_checks", []) or [])

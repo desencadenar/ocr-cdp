@@ -10,6 +10,9 @@
   "exportar_pdf_ordenado": false,
   "padron_ruc": null,
   "padron_dias_maximos": null,
+  "consulta_ruc": null,
   "unificar_notas_en_proveedor": true,
-  "tolerancia_redondeo": 0.02
+  "tolerancia_redondeo": 0.02,
+  "conservar_estado_corrida": true,
+  "guardar_lectura_completa": true
 }

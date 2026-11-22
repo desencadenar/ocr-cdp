@@ -9,6 +9,76 @@ Todo se procesa íntegramente en tu equipo, sin subir documentos a internet ni d
 
 ---
 
+## Novedades: versión 1.1 · Detección y control más confiables
+
+Esta versión cambia el criterio de fondo del programa: **lo que no se pudo comprobar ya no pasa por verificado**. Cada control dice con honestidad si comparó o no, y lo dudoso llega a `revision` con un motivo claro. A la vez, el programa lee mejor los comprobantes reales, así que deja menos trabajo manual.
+
+**Detección más segura**
+- Un comprobante con RUC, serie y correlativo e importes ya no se descarta como guía, orden de compra o estado de cuenta solo porque su título no se lee o porque menciona esos documentos.
+- Las leyendas legales («R.S. … /SUNAT»), los teléfonos y las cuentas bancarias del pie ya no se confunden con la serie y el correlativo; se prefiere la serie del recuadro fiscal.
+- El cliente se reconoce aunque el rótulo venga con variantes de escritura o errores del OCR, y aunque rótulos y valores estén en columnas separadas.
+- Se leen la serie física «001 - N° 0012345» y las facturas electrónicas en inglés.
+- Una línea de orden de compra dentro de la factura ya no la parte en dos.
+
+**Importes que no se inventan**
+- Un importe ambiguo, como `10.000`, queda en blanco y va a revisión en vez de leerse dividido entre mil.
+- El `S/` mal leído por el OCR («57» o «Si») ya no se pega al importe.
+- La confianza baja del OCR en base, IGV y total también genera aviso, no solo en los datos de identidad.
+- Las descripciones y los ítems se leen mejor: la glosa se conserva y la cantidad y el precio no se mezclan con el texto.
+
+**Controles que dicen lo que de verdad comprobaron**
+- El cuadre distingue `cuadra` de `no_contradice`: sin IGV o sin componentes no se da por bueno, y no se fuerza con valores absolutos.
+- El control de tasa usa una tolerancia fija, reconoce el IVAP solo cuando corresponde y marca las tasas especiales para verificar.
+- Con la consulta RUC de SUNAT, la tasa especial de restaurantes y hoteles se decide por el giro del emisor y, en los giros mixtos, por lo que dice el propio comprobante.
+- El cotejo con QR solo dice `coincide` si comparó RUC, serie y total, y avisa cuando no se pudo ejecutar.
+- El aviso de retención en honorarios considera la moneda y ya no se apaga por una palabra suelta.
+- El cotejo de razón social con el padrón distingue empresas de nombre parecido.
+
+**Hojas coherentes y etiquetas prudentes**
+- `requiere_revision_humana` coincide siempre con la hoja `revision`.
+- Las ventas propias se reconocen como tales y no se cuentan dos veces.
+- El ticket de máquina registradora ya no recibe un «No» de crédito fiscal: queda para verificar según el RUC del adquirente y el impuesto discriminado.
+- «RUC OK» se sustituye por «RUC receptor coincide» y solo aparece si no hay otras observaciones.
+
+**Trabajo más ágil y privado**
+- El comando `redetectar` vuelve a aplicar las reglas sobre la lectura guardada, sin repetir el OCR.
+- Los archivos de un ZIP ya no se retienen en memoria durante toda la corrida.
+- El README advierte qué guarda la carpeta `.ocr_fiscal/` y cómo no conservarla.
+- Se retiró código sin uso.
+
+```mermaid
+flowchart LR
+    A["Carpetas y ZIP"] --> B["Lectura<br/>texto nativo u OCR"]
+    B --> C["Detección del comprobante"]
+    C --> D["Extracción de identidad,<br/>importes e ítems"]
+    D --> E["Controles fiscales"]
+    E --> F["CDP.xlsx y expediente PDF"]
+    B -. "lectura guardada" .-> R["redetectar<br/>sin repetir OCR"]
+    R --> C
+
+    C --- C1["No descarta comprobantes<br/>con estructura completa"]
+    D --- D1["Serie del recuadro fiscal,<br/>cliente por aproximación,<br/>importes ambiguos en blanco"]
+    E --- E1["cuadra frente a no_contradice,<br/>tasa por giro del emisor,<br/>QR que solo coincide si compara"]
+    F --- F1["Revisión coherente<br/>y etiquetas prudentes"]
+
+    classDef mejora fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    class C1,D1,E1,F1,R mejora
+```
+
+### Cómo puede seguir mejorando
+
+```mermaid
+flowchart TD
+    H["Versión 1.1<br/>detección y control confiables"] --> N1["Reglas para boletos aéreos<br/>y recibos de telecomunicaciones"]
+    H --> N2["Tickets térmicos y<br/>comprobantes de emisores pequeños"]
+    H --> N3["Cotejo con QR activado por defecto<br/>y probado con códigos reales"]
+    H --> N4["Muestras anonimizadas de escaneos<br/>para medir la precisión por campo"]
+    H --> N5["Normas con fecha de vigencia y fuente:<br/>tasas, bancarización y retenciones"]
+    H --> N6["Expediente PDF alineado<br/>con la hoja de revisión"]
+```
+
+---
+
 ## Empezar
 
 Necesitas **Python 3.11, 3.12 o 3.13**. Abre una terminal en la carpeta del proyecto y ejecuta:
@@ -48,8 +118,8 @@ En GitHub los diagramas Mermaid se dibujan automáticamente sin instalar extensi
 | `Pillow` (`12.3.0`) | Carga de imágenes y TIFF multipágina, corrección de orientación EXIF y recompresión adaptativa de imágenes hacia PDF. | [requirements.txt](requirements.txt) |
 | `openpyxl` (`3.1.5`) y `et-xmlfile` (`2.0.0`) | Construcción de `CDP.xlsx` (6 pestañas, formatos de texto, moneda y fechas reales) y plantillas de calibración. | [requirements.txt](requirements.txt) |
 | `Tesseract OCR` *(programa externo)* | Reconocimiento óptico de caracteres por subproceso con salida TSV palabra por palabra y detección automática de rotación (`--psm 0`). | Configurado en [config.json](config.json) |
-| Módulos estándar de Python | `sqlite3` (estado de corrida en `.ocr_fiscal/state.sqlite3` y Padrón RUC local), `zipfile` (apertura segura en memoria de ZIPs anidados), `tkinter` (ventana gráfica) y `unittest` (pruebas). | Biblioteca estándar de Python |
-| Extras opcionales del entorno | Si instalas por separado `zxingcpp` en tu Python, decodifica códigos QR SUNAT (incluso vectoriales); si instalas `pillow-heif`, admite imágenes `.heic`. | Opcionales (no incluidos en [requirements.txt](requirements.txt)) |
+| Módulos estándar de Python | `sqlite3` (estado de corrida en `.ocr_fiscal/state.sqlite3` y Padrón RUC local), `zipfile` (apertura segura de ZIPs anidados; cada miembro por leer se escribe a un temporal del sistema que se borra al terminar la corrida), `tkinter` (ventana gráfica) y `unittest` (pruebas). | Biblioteca estándar de Python |
+| Extras opcionales del entorno | Si instalas por separado `zxingcpp` en tu Python (`pip install zxing-cpp`), decodifica códigos QR SUNAT (incluso vectoriales); si instalas `pillow-heif`, admite imágenes `.heic`. Sin `zxingcpp` el cotejo QR no se ejecuta: la columna `cotejo_qr_sunat` dice `qr_no_ejecutado` (no `sin_qr`) y la hoja `resumen` lo avisa. | Opcionales (no incluidos en [requirements.txt](requirements.txt)) |
 
 ---
 
@@ -123,18 +193,38 @@ En tipos extendidos (`05`, `10`, `12`, `13`, `14`, `16`, `50`, `52`, `54`) el co
 ### Control de tasa efectiva de IGV (informativo)
 Esta validación vive y se configura directamente en la función `evaluate_igv_rate` de [amounts.py](src/ocr_fiscal/amounts.py) (sin requerir parámetros extra en [config.json](config.json)). Además del cuadre aritmético exacto, contrasta la tasa conjunta facturada (**IGV + IPM**) frente a las tasas vigentes en Perú:
 - **18 %**: tasa estándar del Régimen General (aun cuando la Ley N.° 32387 redistribuya gradualmente puntos entre IGV e IPM, el total facturado sigue siendo `18 %`).
-- **Tasa especial del IGV para restaurantes, hoteles y alojamientos turísticos (Ley N.° 31556 y modificatoria Ley N.° 32219, junto al IPM de la Ley N.° 32387):** **10 %** hasta 2025 (`8 % IGV + 2 % IPM`), **10.5 %** en 2026 (`8 % IGV + 2.5 % IPM`) y **15 %** en 2027 (`12 % IGV + 3 % IPM`), retornando a `18 %` desde 2028 salvo prórroga (en notas `07` y `08` también se toleran tasas de años previos). **Importante:** este régimen **no aplica a cualquier MYPE**; solo alcanza a micro y pequeñas empresas (ingresos hasta `1,700 UIT` y sin vinculación con grandes grupos) cuyo giro principal —mínimo `70 %` de sus ingresos— sea restaurantes, hoteles o alojamientos turísticos, excluyendo servicios de *catering* y concesionarios de alimentos. Como la herramienta no consulta la ficha RUC/CIIU de actividad del emisor, acepta numéricamente estas tasas cuando coinciden con el año de emisión y deja la verificación del giro del proveedor al auditor contable.
-- **4 %**: tasa especial del IVAP.
+- **Tasa especial del IGV para restaurantes, hoteles y alojamientos turísticos (Ley N.° 31556 y modificatoria Ley N.° 32219, junto al IPM de la Ley N.° 32387):** **10 %** hasta 2025 (`8 % IGV + 2 % IPM`), **10.5 %** en 2026 (`8 % IGV + 2.5 % IPM`) y **15 %** en 2027 (`12 % IGV + 3 % IPM`), retornando a `18 %` desde 2028 salvo prórroga (en notas `07` y `08` también se toleran tasas de años previos). **Importante:** este régimen **no aplica a cualquier MYPE**; solo alcanza a micro y pequeñas empresas (ingresos hasta `1,700 UIT` y sin vinculación con grandes grupos) cuyo giro principal —mínimo `70 %` de sus ingresos— sea restaurantes, hoteles o alojamientos turísticos, excluyendo servicios de *catering* y concesionarios de alimentos. La herramienta no consulta la red. Sin datos del emisor, una tasa especial sale como `tasa_especial_verificar` y va a `revision`. Con `--consulta-ruc <archivo>` (o `consulta_ruc` en `config.json`) se lee el archivo que genera la consulta RUC múltiple de SUNAT (`consulta_ruc.py`: Excel `RUCs_SUNAT` o TXT con `|`) y el CIIU del emisor decide (D.S. 237-2022-EF, CIIU Rev. 4): principal 5510 o 5610 con la tasa del año da `tasa_especial_valida`, que no va a `revision`; otro giro, catering (5621) o concesionario (5629) da `tasa_igv_atipica`; sin el RUC en la consulta, restaurante u hotel solo como actividad secundaria, estado distinto de ACTIVO o inicio de actividades posterior al comprobante, sigue `tasa_especial_verificar`. La consulta de SUNAT trae la descripción Rev. 3 sin código, y dos de esas clases mezclan giros que entran con otros que no: con «RESTAURANTES, BARES Y CANTINAS» u «HOTELES, CAMPAMENTOS Y OTROS» deciden las descripciones del propio comprobante (glosa e ítems). Comida en el primer caso o alojamiento en el segundo dan `tasa_especial_valida`; solo bebidas de bar, campamento o descripciones ausentes o ajenas dejan `tasa_especial_verificar`. La columna `ciiu_emisor` muestra los códigos y el archivo de origen. El CIIU es el actual, no el de la fecha del comprobante, y no se verifica la condición de MYPE ni el 70 % de ingresos. El régimen rige desde el 1 de septiembre de 2022. En notas `07` y `08` se admite también la tasa especial del año anterior, no más atrás. Sin fecha de emisión legible, cualquier tasa especial queda para verificar.
+- **4 %**: tasa especial del IVAP. Solo se acepta si el documento menciona IVAP o arroz pilado; si no, la tasa es atípica.
 - **0 %**: operaciones exoneradas, inafectas o de exportación (y reconocimiento específico de IGV referencial en transferencias gratuitas sin derecho a crédito fiscal).
 
-Si una tasa no corresponde a ninguno de los supuestos esperados, no se altera el cuadre aritmético, pero se deja constancia en `control_tasa_igv` y en `revision`.
+La diferencia admitida entre el IGV leído y base × tasa es absoluta (`0.10`), no proporcional a la base. Si una tasa no corresponde a ninguno de los supuestos esperados, no se altera el cuadre aritmético, pero se deja constancia en `control_tasa_igv` y en `revision`. Si no se pudo comparar (falta la base o el IGV), el estado es `no_evaluable` y no cuenta como consistente; en facturas, notas, tickets, documentos SBS y recibos de servicios públicos va además a `revision`.
 
 ### Reglas y casos especiales en el cuadre (`amounts.py`)
 - Tolerancia de redondeo configurable mediante `tolerancia_redondeo` (`0.02` por defecto), marcando el resultado como `cuadra_con_redondeo` cuando aplica.
-- Soporte explícito para operaciones 100 % gratuitas, percepción sumada o detracción restada sobre `total_a_pagar`, RHE con retención del 8 % (inclusive entre paréntesis), ISC incluido en la base imponible, FISE contenido en operaciones inafectas, anticipos deducidos al pie, signos mixtos en Notas de Crédito y Nota de Crédito Tipo 13 en cero.
+- Soporte explícito para operaciones 100 % gratuitas, percepción sumada o detracción restada sobre `total_a_pagar`, RHE con retención del 8 % (inclusive entre paréntesis), ISC incluido en la base imponible, FISE contenido en operaciones inafectas, anticipos deducidos al pie, Notas de Crédito con todos los componentes de un signo y el total del contrario, y Nota de Crédito Tipo 13 en cero (exige el código 13 o la leyenda del ajuste; la palabra «cuota» sola no basta). Si los componentes tienen signos mezclados no se cuadra con valores absolutos.
+- Sin IGV leído, en un comprobante con base gravada o sin desglose, el cuadre no se da por bueno: sale `no_contradice` y va a `revision`.
+- Un importe con un solo punto y tres dígitos (`10.000`) o con coma y un dígito (`100,5`) es ambiguo: queda en blanco y genera `importe_formato_ambiguo` en `revision`.
 - Si `currency` resulta contradictorio dentro del bloque (`S/` y `USD` mezclados) o el OCR pega símbolos ambiguos de moneda al primer dígito (por ejemplo `$755.00`), el dato se deja en blanco para revisión en lugar de suponerse.
 
 ---
+
+## Estados y etiquetas que cambiaron en la versión 1.1
+
+Para que nada que no se pudo comprobar pase por verificado, estos estados se agregaron o cambiaron de sentido:
+
+| Dónde | Antes | Ahora |
+| --- | --- | --- |
+| `cuadre_de_importes` | `cuadra` aunque faltara el IGV o sin componentes | `no_contradice` (va a `revision`) |
+| `control_tasa_igv` | `no_evaluable` y `no_aplica` contaban como consistentes | Siguen esos nombres, pero no cuentan como verificados; `no_evaluable` va a `revision` en los tipos que discriminan IGV |
+| `control_tasa_igv` | `tasa_valida` para 10 %, 10.5 % y 15 % | `tasa_especial_verificar` (va a `revision`) |
+| `cotejo_qr_sunat` | `sin_qr` también cuando no estaba `zxingcpp` | `qr_no_ejecutado` (sin lector), `sin_qr` (se buscó y no hay) |
+| `cotejo_qr_sunat` | `coincide` aunque no se comparara nada | `coincide` exige RUC emisor, serie y total; si falta alguno, `coincide_parcial`; si ningún QR se vincula, `qr_no_vinculado` (va a `revision`) |
+| `apto_credito_fiscal_preliminar` | «No: Boleta/Ticket/Terrestre» | Boleta: «No: Boleta de venta»; ticket `12`: «Verificar: … solo si consigna el RUC del adquirente y discrimina el IGV»; boleto terrestre `16`: «No (duda normativa abierta)» |
+| `apto_credito_fiscal_preliminar` | «No: RUC receptor distinto» en ventas propias | «No: posible venta propia (RUC emisor igual al RUC objetivo)» |
+| `apto_credito_fiscal_preliminar` | «Revisar: RUC OK; pendiente validez CPE y SPOT» | «Revisar: RUC receptor coincide; pendiente validez CPE y SPOT», solo si no hay observaciones; si las hay, «…; observaciones de cuadre, tasa IGV, lectura OCR, padrón» |
+| `requiere_revision_humana` | Podía decir `False` con hallazgos en `revision` | Es `True` siempre que la fila tenga al menos un hallazgo en `revision` |
+| `revision` | — | Nuevos tipos: `importe_formato_ambiguo`, `no_evaluable`, `tasa_especial_verificar`, `qr_no_vinculado`. Una venta propia ya no genera además `ruc_receptor_distinto` |
+| Descarte de soportes | Un bloque sin título legible que citaba una guía, OC, HES o estado de cuenta se descartaba | Si tiene RUC válido, serie-correlativo, IGV y total, queda `indeterminado` (regla `soporte_con_estructura_de_comprobante`) y va a `revision` |
 
 ## Organización opcional en `expediente_pdf/`
 
@@ -175,9 +265,14 @@ Abre [config.json](config.json) con cualquier editor de texto y cambia el valor 
 | `revisar_archivos_zip` | `true` | Abre contenedores `.zip` (y ZIPs anidados) aplicando límites de profundidad, miembros, tamaño total y razón de compresión. |
 | `exportar_pdf_ordenado` | `false` | Con `true`, genera automáticamente la carpeta `expediente_pdf/` al finalizar el análisis. |
 | `padron_ruc` | `null` | Ruta a la base SQLite local del Padrón RUC (`null` para procesar sin padrón). Las rutas relativas parten de la carpeta del JSON. |
-| `padron_dias_maximos` | `null` | Antigüedad máxima permitida del padrón en días (entero ≥ 1, o `null` sin límite). Si se excede, marca los RUC como `obsoleto`. |
+| `consulta_ruc` | `null` | Ruta al archivo de la consulta RUC múltiple SUNAT (salida de `consulta_ruc.py`: `.xlsx` o `.txt` separado por barras verticales) con el CIIU de los emisores. Decide la tasa especial de restaurantes y hoteles. El programa solo lo lee; no consulta la red. |
+| `padron_dias_maximos` | `null` | Antigüedad máxima permitida del padrón en días (entero ≥ 1, o `null` sin límite). Si se excede, marca los RUC como `obsoleto`. Sin límite, la fecha de corte se muestra en `resumen` como dato informativo. |
 | `unificar_notas_en_proveedor` | `true` | Con `true`, agrupa las notas `07`/`08` dentro de `01_cdp_por_proveedor/`; con `false`, las separa en `02_notas_por_proveedor/`. |
 | `tolerancia_redondeo` | `0.02` | Diferencia máxima aceptada (`0` a `0.5`) entre el total calculado y el leído para considerar que cuadra con redondeo. |
+| `conservar_estado_corrida` | `true` | Si es `false`, borra `.ocr_fiscal/` (con `state.sqlite3` y `lecturas.sqlite3`) después de escribir `CDP.xlsx`. Sin ese estado, los comandos `export` y `redetectar` ya no pueden regenerar el Excel. |
+| `guardar_lectura_completa` | `true` | Guarda la lectura completa de cada documento (texto, líneas con coordenadas y confianza, QR y relecturas de línea) en `.ocr_fiscal/lecturas.sqlite3`. Con ella, `redetectar` repite la detección sin Tesseract. Con `false` no se guarda y `redetectar` no está disponible para esa corrida. |
+
+> **Aviso de privacidad.** Con el ajuste por defecto `"guardar_lectura_completa": true`, `.ocr_fiscal/lecturas.sqlite3` guarda **la transcripción completa** de cada documento leído. `.ocr_fiscal/state.sqlite3` guarda además fragmentos: las líneas que respaldan cada dato, RUC, razones sociales, importes, descripciones e ítems. Quien reciba la carpeta de salida recibe todo eso. Para compartir solo el Excel, entrega `CDP.xlsx`. Para no guardar la transcripción, usa `"guardar_lectura_completa": false`; para no conservar nada, `"conservar_estado_corrida": false`.
 
 ---
 
@@ -189,11 +284,13 @@ Reemplaza `RUC_RECEPTOR` por el RUC de 11 dígitos que deseas contrastar y usa s
 python iniciar.py scan --input entrada --output salida --recipient-ruc RUC_RECEPTOR --exportar-pdf
 python iniciar.py scan --input entrada --output salida --recipient-ruc RUC_RECEPTOR --padron-db padron.sqlite3 --exportar-pdf
 python iniciar.py export --output salida
+python iniciar.py redetectar --output salida --destino salida_redetectada
 ```
 
 - `ui`: abre la ventana gráfica (es el comando por defecto si ejecutas `python iniciar.py` sin argumentos).
 - `scan`: procesa la carpeta de entrada y genera `CDP.xlsx` (con `--config`, `--padron-db`, `--no-inspect-archives` y `--exportar-pdf` opcionales).
 - `export`: regenera `CDP.xlsx` desde `.ocr_fiscal/state.sqlite3` sin volver a leer los PDF ni ejecutar OCR.
+- `redetectar`: vuelve a aplicar la detección y la extracción sobre las lecturas guardadas de una corrida (`lecturas.sqlite3`) y escribe una corrida nueva en `--destino`, sin Tesseract. Sirve para medir en segundos un cambio de reglas. Toma de la corrida de origen la carpeta de documentos, el RUC objetivo, el padrón y la consulta RUC, salvo que se indiquen (`--input`, `--recipient-ruc`, `--padron-db`, `--consulta-ruc`, `--config`, `--exportar-pdf`). Un documento sin lectura guardada (nuevo, modificado o leído con otra resolución o idioma) queda como error de lectura con el motivo «lectura no guardada». La relectura del recuadro de importes (`releer_recuadro_importes`) no se repite.
 - `preparar-padron`: convierte el archivo oficial `.txt` o `.zip` del Padrón Reducido de SUNAT a una base SQLite local lista para usar:
 
 ```text
@@ -211,7 +308,7 @@ python iniciar.py calibrar --input muestra --reference referencia.xlsx --output 
 
 ## Pruebas automáticas
 
-El repositorio incluye pruebas sintéticas locales (sin usar comprobantes reales ni exigir Tesseract ni conexión a red) en [test_ocr_fiscal.py](tests/test_ocr_fiscal.py). Para ejecutarlas:
+El repositorio incluye pruebas sintéticas locales (sin usar comprobantes reales ni exigir Tesseract ni conexión a red): [test_ocr_fiscal.py](tests/test_ocr_fiscal.py) cubre el flujo general, [test_controles_fiscales.py](tests/test_controles_fiscales.py) los controles de detección, cuadre, tasas, QR y etiquetas, y [test_precision.py](tests/test_precision.py) la lectura de series, rótulos, ítems e importes y la decisión de la tasa especial por giro. Para ejecutarlas:
 
 ```text
 .venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -231,7 +328,7 @@ Los archivos de [src/ocr_fiscal](src/ocr_fiscal) están comentados en español, 
 4. [archives.py](src/ocr_fiscal/archives.py) y [ocr.py](src/ocr_fiscal/ocr.py): recorrido seguro de carpetas/ZIPs e interfaz de subproceso con Tesseract.
 5. [documents.py](src/ocr_fiscal/documents.py) y [amount_panel.py](src/ocr_fiscal/amount_panel.py): decisión entre texto nativo PyMuPDF y OCR, lectura de QR y relectura opcional de recuadro de importes.
 6. [amounts.py](src/ocr_fiscal/amounts.py), [visible.py](src/ocr_fiscal/visible.py) y [extraction.py](src/ocr_fiscal/extraction.py): extracción de importes, tasas variables de IGV, leyendas/datos SPOT, clasificación de comprobantes vs soportes y detalle de ítems.
-7. [padron.py](src/ocr_fiscal/padron.py) y [storage.py](src/ocr_fiscal/storage.py): consulta SQLite local del Padrón RUC y persistencia de la corrida en `.ocr_fiscal/state.sqlite3`.
+7. [padron.py](src/ocr_fiscal/padron.py), [ciiu.py](src/ocr_fiscal/ciiu.py), [storage.py](src/ocr_fiscal/storage.py) y [reading_cache.py](src/ocr_fiscal/reading_cache.py): consulta SQLite local del Padrón RUC, giro del emisor según la consulta RUC, persistencia de la corrida en `.ocr_fiscal/state.sqlite3` y lectura guardada para `redetectar`.
 8. [processor.py](src/ocr_fiscal/processor.py), [pdf_organizer.py](src/ocr_fiscal/pdf_organizer.py), [exports.py](src/ocr_fiscal/exports.py) y [benchmark.py](src/ocr_fiscal/benchmark.py): orquestación, cotejo QR, deduplicación, armado de `expediente_pdf/`, generación de `CDP.xlsx` y calibración.
 
 ---

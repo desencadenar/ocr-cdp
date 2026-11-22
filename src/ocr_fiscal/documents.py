@@ -7,7 +7,6 @@ import re
 import tempfile
 import time
 from typing import Any
-import xml.etree.ElementTree as ET
 
 import pymupdf
 from PIL import Image, ImageOps, ImageStat
@@ -23,6 +22,9 @@ try:
     import zxingcpp  # type: ignore[import-not-found]
 except Exception:
     zxingcpp = None
+
+# Sin `zxingcpp` no se buscan códigos QR. El cotejo lo informa como «qr_no_ejecutado», no como «sin_qr».
+QR_DECODER_AVAILABLE = zxingcpp is not None
 
 from .archives import WorkUnit, detect_format_from_bytes
 from .config import AppConfig
@@ -367,7 +369,7 @@ def reocr_line_bbox(
     if not available:
         return None
     fmt = unit.source_ref.detected_format.lower()
-    raw_bytes = unit.content_bytes
+    raw_bytes = unit.read_bytes()
     x0, y0, x1, y1 = bbox
     pad_x = max(12.0, (x1 - x0) * 0.08)
     pad_y = max(8.0, (y1 - y0) * 0.45)
@@ -503,296 +505,6 @@ def _extract_native_pdf_layout(page: pymupdf.Page, y_tol: float = 3.0) -> tuple[
         )
         text_lines.append(line_text)
     return "\n".join(text_lines), layout_lines
-
-
-# DEPRECADO: sólo lo usa el lector de XML, que ya no se ejecuta.
-def _local_tag(tag: str) -> str:
-    return tag.split("}", 1)[-1] if "}" in tag else tag
-
-
-# DEPRECADO: lector de facturas XML (UBL). Los XML se excluyen desde el inventario y nunca llegan aquí.
-# Se conserva por si algún día se retoma ese flujo; el resto de este archivo no depende de él.
-def _parse_xml_bytes(raw_bytes: bytes, source_path: Path) -> DocumentRead:
-    started = time.perf_counter()
-    events: list[StageEvent] = [StageEvent("format_detection", "succeeded", "xml", 1)]
-    text_decoded = raw_bytes.decode("utf-8", errors="replace")
-    if "<!ENTITY" in text_decoded.upper() or "<!DOCTYPE" in text_decoded.upper():
-        raise DocumentReadError("XML con declaraciones DOCTYPE/ENTITY bloqueado por seguridad local")
-    try:
-        root = ET.fromstring(raw_bytes)
-    except ET.ParseError as exc:
-        raise DocumentReadError(f"No se pudo analizar XML: {exc}") from exc
-
-    root_name = _local_tag(root.tag)
-    type_map = {
-        "Invoice": ("01", "FACTURA ELECTRÓNICA"),
-        "CreditNote": ("07", "NOTA DE CRÉDITO ELECTRÓNICA"),
-        "DebitNote": ("08", "NOTA DE DÉBITO ELECTRÓNICA"),
-    }
-    doc_code, doc_title = type_map.get(root_name, (None, root_name))
-
-    notes: dict[str, str] = {}
-    top_id: str | None = None
-    issue_date: str | None = None
-    due_date: str | None = None
-    currency: str | None = None
-    type_code_obs: str | None = None
-    supplier_ruc: str | None = None
-    supplier_name: str | None = None
-    customer_ruc: str | None = None
-    customer_name: str | None = None
-    payment_condition: str | None = None
-    tax_amount: str | None = None
-    taxable_amount: str | None = None
-    inafecto_amount: str | None = None
-    exonerado_amount: str | None = None
-    line_extension_amount: str | None = None
-    payable_amount: str | None = None
-    referenced_doc: str | None = None
-    items: list[dict[str, str | None]] = []
-
-    for child in root:
-        cname = _local_tag(child.tag)
-        val = (child.text or "").strip()
-        if cname == "ID" and val and top_id is None:
-            top_id = val
-        elif cname == "IssueDate" and val:
-            issue_date = val
-        elif cname == "DueDate" and val:
-            due_date = val
-        elif cname in {"InvoiceTypeCode", "CreditNoteTypeCode", "DebitNoteTypeCode"} and val:
-            type_code_obs = val
-        elif cname == "DocumentCurrencyCode" and val:
-            currency = val
-        elif cname == "Note" and val:
-            loc = child.attrib.get("languageLocaleID", "note")
-            notes[loc] = val
-        elif cname == "UBLExtensions":
-            for prop in child.iter():
-                if _local_tag(prop.tag) == "AdditionalProperty":
-                    pid = ""
-                    pval = ""
-                    for sub in prop:
-                        sname = _local_tag(sub.tag)
-                        if sname == "ID":
-                            pid = (sub.text or "").strip()
-                        elif sname == "Value":
-                            pval = (sub.text or "").strip()
-                    if pid and pval:
-                        notes[pid] = pval
-        elif cname == "BillingReference":
-            for sub in child.iter():
-                if _local_tag(sub.tag) == "ID" and (sub.text or "").strip():
-                    referenced_doc = (sub.text or "").strip()
-                    break
-        elif cname == "AccountingSupplierParty":
-            for sub in child.iter():
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname in {"ID", "CustomerAssignedAccountID"} and len(sval) == 11 and sval.isdigit():
-                    supplier_ruc = sval
-                elif sname == "RegistrationName" and sval:
-                    supplier_name = sval
-                elif sname == "Name" and sval and not supplier_name:
-                    supplier_name = sval
-        elif cname == "AccountingCustomerParty":
-            for sub in child.iter():
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname in {"ID", "CustomerAssignedAccountID"} and len(sval) == 11 and sval.isdigit():
-                    customer_ruc = sval
-                elif sname == "RegistrationName" and sval:
-                    customer_name = sval
-                elif sname == "Name" and sval and not customer_name:
-                    customer_name = sval
-        elif cname == "PaymentTerms":
-            p_id = ""
-            p_means = ""
-            for sub in child:
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname == "ID":
-                    p_id = sval
-                elif sname == "PaymentMeansID":
-                    p_means = sval
-                elif sname == "PaymentDueDate" and sval and not due_date:
-                    due_date = sval
-            if p_id == "FormaPago" and p_means and not payment_condition:
-                payment_condition = p_means
-        elif cname == "TaxTotal":
-            for sub in child:
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname == "TaxAmount" and sval and tax_amount is None:
-                    tax_amount = sval
-                elif sname == "TaxSubtotal":
-                    sub_taxable = None
-                    sub_tax = None
-                    sub_scheme = ""
-                    for tnode in sub.iter():
-                        tname = _local_tag(tnode.tag)
-                        tval = (tnode.text or "").strip()
-                        if tname == "TaxableAmount" and tval:
-                            sub_taxable = tval
-                        elif tname == "TaxAmount" and tval:
-                            sub_tax = tval
-                        elif tname == "Name" and tval:
-                            sub_scheme = tval.upper()
-                    if sub_scheme in {"IGV", "VAT"} and sub_taxable:
-                        taxable_amount = sub_taxable
-                        if sub_tax:
-                            tax_amount = sub_tax
-                    elif sub_scheme in {"INA", "INAFECTO"} and sub_taxable:
-                        inafecto_amount = sub_taxable
-                    elif sub_scheme in {"EXO", "EXONERADO"} and sub_taxable:
-                        exonerado_amount = sub_taxable
-        elif cname == "LegalMonetaryTotal":
-            for sub in child:
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname == "LineExtensionAmount" and sval:
-                    line_extension_amount = sval
-                elif sname == "PayableAmount" and sval:
-                    payable_amount = sval
-                elif sname == "TaxInclusiveAmount" and sval and not payable_amount:
-                    payable_amount = sval
-        elif cname in {"InvoiceLine", "CreditNoteLine", "DebitNoteLine"}:
-            item_id = None
-            qty = None
-            unit = None
-            line_ext = None
-            unit_price = None
-            desc_parts: list[str] = []
-            code = None
-            for sub in child:
-                sname = _local_tag(sub.tag)
-                sval = (sub.text or "").strip()
-                if sname == "ID" and sval:
-                    item_id = sval
-                elif sname in {"InvoicedQuantity", "CreditedQuantity", "DebitedQuantity"} and sval:
-                    qty = sval
-                    unit = sub.attrib.get("unitCode")
-                elif sname == "LineExtensionAmount" and sval:
-                    line_ext = sval
-                elif sname == "PricingReference":
-                    for pnode in sub.iter():
-                        if _local_tag(pnode.tag) == "PriceAmount" and (pnode.text or "").strip():
-                            unit_price = (pnode.text or "").strip()
-                elif sname == "Price" and not unit_price:
-                    for pnode in sub.iter():
-                        if _local_tag(pnode.tag) == "PriceAmount" and (pnode.text or "").strip():
-                            unit_price = (pnode.text or "").strip()
-                elif sname == "Item":
-                    for inode in sub:
-                        iname = _local_tag(inode.tag)
-                        ival = (inode.text or "").strip()
-                        if iname == "Description" and ival:
-                            desc_parts.append(ival)
-                        elif iname == "SellersItemIdentification":
-                            for cnode in inode.iter():
-                                if _local_tag(cnode.tag) == "ID" and (cnode.text or "").strip():
-                                    code = (cnode.text or "").strip()
-            items.append(
-                {
-                    "item_id": item_id,
-                    "code": code,
-                    "description": " - ".join(desc_parts) if desc_parts else None,
-                    "quantity": qty,
-                    "unit": unit,
-                    "unit_price": unit_price,
-                    "line_total": line_ext,
-                }
-            )
-
-    structured = {
-        "root_tag": root_name,
-        "document_type_code": type_code_obs if type_code_obs in {"01", "03", "07", "08"} else doc_code,
-        "document_title": doc_title,
-        "id": top_id,
-        "issue_date": issue_date,
-        "due_date": due_date,
-        "currency": currency,
-        "supplier_ruc": supplier_ruc,
-        "supplier_name": supplier_name,
-        "customer_ruc": customer_ruc,
-        "customer_name": customer_name,
-        "payment_condition": payment_condition,
-        "referenced_document": referenced_doc,
-        "subtotal": taxable_amount or line_extension_amount,
-        "inafecto": inafecto_amount,
-        "exonerado": exonerado_amount,
-        "igv": tax_amount,
-        "total": payable_amount,
-        "general_description": notes.get("SUMMARY") or notes.get("SUSTENTO") or notes.get("note"),
-        "notes": notes,
-        "items": items,
-    }
-
-    synth_lines: list[str] = []
-    if doc_title:
-        synth_lines.append(doc_title)
-    if top_id:
-        synth_lines.append(f"ID UBL: {top_id}")
-    if supplier_name:
-        synth_lines.append(f"RAZÓN SOCIAL DEL EMISOR: {supplier_name}")
-    if supplier_ruc:
-        synth_lines.append(f"RUC EMISOR: {supplier_ruc}")
-    if customer_name:
-        synth_lines.append(f"RAZÓN SOCIAL ADQUIRENTE: {customer_name}")
-    if customer_ruc:
-        synth_lines.append(f"RUC ADQUIRENTE: {customer_ruc}")
-    if issue_date:
-        synth_lines.append(f"FECHA DE EMISIÓN: {issue_date}")
-    if due_date:
-        synth_lines.append(f"FECHA DE VENCIMIENTO: {due_date}")
-    if currency:
-        synth_lines.append(f"MONEDA: {currency}")
-    if payment_condition:
-        synth_lines.append(f"FORMA DE PAGO: {payment_condition}")
-    if structured["general_description"]:
-        synth_lines.append(f"GLOSA: {structured['general_description']}")
-    for idx, item in enumerate(items, start=1):
-        synth_lines.append(
-            f"ITEM {idx}: {item.get('description') or ''} | CANT: {item.get('quantity') or ''} "
-            f"{item.get('unit') or ''} | P.UNIT: {item.get('unit_price') or ''} | VALOR VENTA: {item.get('line_total') or ''}"
-        )
-    if structured["subtotal"]:
-        synth_lines.append(f"VALOR DE VENTA: {structured['subtotal']}")
-    if inafecto_amount:
-        synth_lines.append(f"INAFECTO: {inafecto_amount}")
-    if tax_amount is not None:
-        synth_lines.append(f"IGV: {tax_amount}")
-    if payable_amount:
-        synth_lines.append(f"TOTAL: {payable_amount}")
-
-    layout_lines = [
-        LayoutLine(line_number=i, text=line, block_number=1, bbox=None, ocr_confidence=None, source="xml_structured")
-        for i, line in enumerate(synth_lines, start=1)
-    ]
-    text = "\n".join(synth_lines)
-    duration_ms = (time.perf_counter() - started) * 1000.0
-    events.append(StageEvent("xml_structured_read", "succeeded", f"UBL {root_name} ({len(items)} ítems)", 1, duration_ms=duration_ms))
-    page = PageRead(
-        page_number=1,
-        text=text,
-        source="xml_structured",
-        status="read" if text else "empty",
-        quality={"xml_bytes": len(raw_bytes), "line_count": len(synth_lines)},
-        ocr_confidence=None,
-        line_confidences={},
-        layout_lines=layout_lines,
-        structured_data=structured,
-    )
-    return DocumentRead(
-        path=source_path,
-        source_format="xml",
-        page_count=1,
-        pages=[page],
-        events=events,
-        status="read" if text else "empty",
-        ocr_engine="none",
-        ocr_version="none",
-    )
 
 
 def _is_native_text_garbled(text: str) -> tuple[bool, int, float]:
@@ -1366,7 +1078,7 @@ def read_work_unit(unit: WorkUnit, engine: OCREngine | None, config: AppConfig |
     fmt = unit.source_ref.detected_format.lower()
     source_path = unit.disk_path or Path(unit.source_ref.source_path)
     # Si el archivo viene del disco, se comprueba que siga existiendo.
-    raw_bytes = unit.content_bytes
+    raw_bytes = unit.read_bytes()
     if raw_bytes is None and unit.disk_path is not None:
         if not unit.disk_path.is_file():
             raise DocumentReadError(f"No existe el archivo: {unit.disk_path}")

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass, field
 import io
+import shutil
+import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import time
 import zipfile
@@ -53,13 +56,24 @@ OFFICE_OPENXML_EXTENSIONS = {".xlsx", ".xlsm", ".docx", ".pptx"}
 
 
 # Una unidad de trabajo: un documento que hay que leer.
-# Está en el disco (disk_path), o en memoria (content_bytes) si salió de un ZIP, o trae un error si no se pudo abrir.
+# Está en el disco (disk_path), en un temporal (spool_path) si salió de un ZIP, en memoria (content_bytes)
+# o trae un error si no se pudo abrir. Los miembros de ZIP se
+# escriben a un temporal en lugar de retenerse en memoria durante toda la corrida.
 @dataclass
 class WorkUnit:
     source_ref: SourceRef
     disk_path: Path | None = None
     content_bytes: bytes | None = None
     error: str | None = None
+    spool_path: Path | None = None
+
+    def read_bytes(self) -> bytes | None:
+        """Bytes del documento si no está en disco: de memoria o del temporal. None si se lee desde disk_path."""
+        if self.content_bytes is not None:
+            return self.content_bytes
+        if self.spool_path is not None:
+            return self.spool_path.read_bytes()
+        return None
 
     @property
     def display_path(self) -> str:
@@ -73,6 +87,8 @@ class WalkResult:
     inventory: list[SourceRef] = field(default_factory=list)
     work_units: list[WorkUnit] = field(default_factory=list)
     archive_summaries: list[ArchiveSummary] = field(default_factory=list)
+    # Carpeta temporal con los miembros de ZIP por leer; el procesador la borra al terminar.
+    spool_dir: Path | None = None
     events: list[StageEvent] = field(default_factory=list)
     top_level_file_count: int = 0
     supported_unit_count: int = 0
@@ -158,6 +174,18 @@ class ContainerWalker:
         self._next_source_id = 0
         self._total_members_seen = 0
         self._total_uncompressed_bytes = 0
+        self._spool_dir: Path | None = None
+
+    # Escribe un miembro de ZIP a un temporal y devuelve su ruta. La carpeta se crea al primer uso y se borra
+    # al terminar la corrida (o, como respaldo, al salir del programa).
+    def _spool(self, data: bytes) -> Path:
+        if self._spool_dir is None:
+            self._spool_dir = Path(tempfile.mkdtemp(prefix="ocr_fiscal_zip_"))
+            atexit.register(shutil.rmtree, self._spool_dir, True)
+        handle = tempfile.NamedTemporaryFile(dir=self._spool_dir, suffix=".bin", delete=False)
+        with handle:
+            handle.write(data)
+        return Path(handle.name)
 
     # Reparte un número de identificación nuevo a cada archivo o miembro que se encuentra.
     def _alloc_id(self) -> int:
@@ -195,6 +223,7 @@ class ContainerWalker:
 
         for path in candidates:
             self._inspect_disk_file(path, result)
+        result.spool_dir = self._spool_dir
         return result
 
     # ¿Este formato se lee como comprobante? Los XML nunca (ver el comentario de abajo).
@@ -775,7 +804,7 @@ class ContainerWalker:
                         compressed_size=info.compress_size,
                     )
                     result.inventory.append(ref)
-                    result.work_units.append(WorkUnit(source_ref=ref, content_bytes=member_bytes))
+                    result.work_units.append(WorkUnit(source_ref=ref, spool_path=self._spool(member_bytes)))
                     result.supported_unit_count += 1
                 else:
                     is_xml = detected_fmt == "xml" or member_suffix == ".xml"

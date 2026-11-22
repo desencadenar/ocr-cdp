@@ -83,6 +83,7 @@ CDP_VALIDOS_COLUMNS: list[tuple[str, str]] = [
     *AMOUNTS_EXPORT,
     ("Tasa IGV efectiva (%)", "tasa_igv_efectiva"),
     ("Control tasa IGV", "igv_rate_status"),
+    ("CIIU emisor", "ciiu_emisor"),
     *SETTLEMENT_EXPORT,
     ("Apto crédito fiscal (preliminar)", "apto_credito_fiscal_preliminar"),
     ("Alerta bancarización", "bancarizacion_flag"),
@@ -499,6 +500,61 @@ def _page_locator_str(document: Mapping[str, Any]) -> str:
     return page_part
 
 
+def _row_control_issues(
+    derived_checks: Sequence[Mapping[str, Any]],
+    arithmetic: Mapping[str, Any],
+    igv_chk: Mapping[str, Any],
+    padron_chk: Mapping[str, Any],
+    secondary_fields: Sequence[str],
+) -> list[str]:
+    """Controles con observaciones que impiden decir solo «pendiente validez CPE y SPOT»."""
+    issues: list[str] = []
+    if arithmetic.get("consistent") is not True:
+        issues.append("cuadre")
+    if igv_chk and (igv_chk.get("consistent") is False or igv_chk.get("needs_review")):
+        issues.append("tasa IGV")
+    if any(chk.get("check") in {"low_ocr_confidence", "ambiguous_amount_format"} for chk in derived_checks):
+        issues.append("lectura OCR")
+    if (padron_chk and padron_chk.get("consistent") is False) or {"emitter_ruc_padron", "recipient_ruc_padron"} & set(secondary_fields):
+        issues.append("padrón")
+    return issues
+
+
+
+def _padron_cutoff_summary(run_details: Mapping[str, Any]) -> str:
+    """Fecha de corte del padrón usado, como dato informativo. No bloquea nada."""
+    info = run_details.get("padron_summary") or {}
+    if info.get("db_status") != "disponible":
+        return "Sin padrón RUC" + (f": {info['reason']}" if info.get("reason") else "")
+    return (
+        f"{info.get('cutoff_date') or 'desconocida'} ({Path(str(info.get('db_path') or '')).name}). "
+        "Si la base no guarda la fecha de corte, es la fecha del archivo. Estado y condición son los de esa fecha."
+    )
+
+
+def _consulta_ruc_summary(run_details: Mapping[str, Any]) -> str:
+    """Origen del CIIU con que se decidió la tasa especial de restaurantes y hoteles."""
+    info = run_details.get("consulta_ruc_summary") or {}
+    if not info.get("path"):
+        return "Sin consulta RUC: las tasas especiales de restaurantes y hoteles quedan para verificar."
+    return (
+        f"{Path(info['path']).name} (archivo del {info.get('query_date') or 'fecha desconocida'}; "
+        f"{info.get('ruc_count', 0)} RUC). El CIIU es el de la consulta, no el de la fecha de cada comprobante."
+    )
+
+
+def _qr_summary(detected_rows: Sequence[Mapping[str, Any]]) -> str:
+    """Resumen del cotejo QR. Si no se ejecutó por falta de zxingcpp, lo dice en vez de callar."""
+    counts: dict[str, int] = {}
+    for row in detected_rows:
+        status = str(row.get("qr_crosscheck_status") or "qr_no_ejecutado")
+        counts[status] = counts.get(status, 0) + 1
+    detail = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+    if counts and set(counts) == {"qr_no_ejecutado"}:
+        return f"No ejecutado: falta zxingcpp, el QR no se leyó en ningún comprobante ({detail})."
+    return detail or "Sin comprobantes"
+
+
 # Convierte un documento guardado en una fila plana con todo lo que cualquier hoja pueda necesitar.
 # Después cada hoja elige las columnas que le interesan.
 def _row(
@@ -551,6 +607,10 @@ def _row(
         check for check in derived_checks
         if check.get("check") == "igv_rate_check"
     ), {})
+    ciiu_chk = next((
+        check for check in derived_checks
+        if check.get("check") == "emitter_ciiu"
+    ), {})
     pdf_chk = next((
         check for check in derived_checks
         if check.get("check") == "pdf_expediente_info"
@@ -559,7 +619,7 @@ def _row(
         "discrepancia" if document.get("emitter_name_discrepancy") else "no_evaluable"
     )
     recipient_match_status = padron_chk.get("recipient_status") or "no_evaluable"
-    qr_crosscheck_status = qr_chk.get("status") or "sin_qr"
+    qr_crosscheck_status = qr_chk.get("status") or "qr_no_ejecutado"
     doc_type_str = str(normalized.get("document_type") or "")
     rec_role_status = str(document.get("recipient_role_status") or "not_found")
     rec_match_bool = bool(document.get("recipient_ruc_match", False))
@@ -567,16 +627,25 @@ def _row(
     eff_rate = igv_chk.get("effective_rate")
 
     # Indicador preliminar de crédito fiscal (nunca sustituye validez oficial CPE ni depósito SPOT).
-    if doc_type_str in {"03", "12", "16"}:
-        apto_cf = "No: Boleta/Ticket/Terrestre (sin crédito fiscal IGV)"
+    # El ticket de máquina registradora (12) sí puede sustentar crédito fiscal si
+    # identifica al adquirente con su RUC y discrimina el impuesto (orientación SUNAT); no recibe un «No» categórico.
+    # El boleto de viaje terrestre (16) mantiene el «No», marcado como duda normativa sin resolver.
+    if doc_type_str == "03":
+        apto_cf = "No: Boleta de venta (sin crédito fiscal IGV)"
+    elif doc_type_str == "16":
+        apto_cf = "No (duda normativa abierta): Boleto de viaje terrestre; confirmar si sustenta crédito fiscal cuando identifica al adquirente"
     elif doc_type_str == "02":
         apto_cf = "No aplica IGV (Recibo por Honorarios)"
     elif doc_type_str in {"20", "40"}:
         apto_cf = "Retención/Percepción (aplicación PDT 621)"
+    # Si el emisor es el RUC objetivo, el comprobante es una posible venta propia; que el receptor sea otro
+    # es consecuencia de eso y no un segundo motivo.
+    elif "emitter_ruc_self" in secondary_fields:
+        apto_cf = "No: posible venta propia (RUC emisor igual al RUC objetivo)"
     elif rec_role_status == "mismatch":
         apto_cf = "No: RUC receptor distinto del objetivo"
-    elif "emitter_ruc_self" in secondary_fields:
-        apto_cf = "No: RUC emisor coincide con RUC objetivo (posible venta)"
+    elif doc_type_str == "12":
+        apto_cf = "Verificar: ticket de máquina registradora; da crédito fiscal solo si consigna el RUC del adquirente y discrimina el IGV"
     elif qr_crosscheck_status == "difiere":
         apto_cf = "Revisar: discrepancia con QR SUNAT"
     elif igv_rate_status == "igv_referencial_gratuita":
@@ -584,7 +653,13 @@ def _row(
     elif rec_role_status in {"not_found", "candidate_unassigned"}:
         apto_cf = "Revisar: RUC receptor no identificado"
     elif rec_match_bool:
-        apto_cf = "Revisar: RUC OK; pendiente validez CPE y SPOT"
+        # «RUC OK» sonaba a dictamen y se emitía sin mirar el resto de
+        # controles. Ahora el texto dice qué coincide y, si hay observaciones, cuáles son.
+        issues = _row_control_issues(derived_checks, arithmetic, igv_chk, padron_chk, secondary_fields)
+        if issues:
+            apto_cf = f"Revisar: RUC receptor coincide; observaciones de {', '.join(issues)}"
+        else:
+            apto_cf = "Revisar: RUC receptor coincide; pendiente validez CPE y SPOT"
     else:
         apto_cf = "Revisar manualmente"
 
@@ -721,6 +796,7 @@ def _row(
         "support_reference": normalized.get("support_reference"),
         "tasa_igv_efectiva": eff_rate,
         "igv_rate_status": igv_rate_status,
+        "ciiu_emisor": ciiu_chk.get("label"),
         "apto_credito_fiscal_preliminar": apto_cf,
         "bancarizacion_flag": bancarizacion_flag,
         "emitter_padron_estado_corte": document.get("emitter_padron_estado"),
@@ -1087,7 +1163,11 @@ def _review_rows(
                     )
 
         # 3. Revisión de receptor: alerta alta si pertenece a otro RUC; media si no se identificó RUC (salvo DNI en Boleta).
-        if r["recipient_role_status"] == "mismatch":
+        own_sale = "emitter_ruc_self" in set(doc.get("secondary_review_fields") or [])
+        if r["recipient_role_status"] == "mismatch" and own_sale:
+            # Una venta propia ya genera posible_venta_propia_en_compras; no se cuenta dos veces.
+            pass
+        elif r["recipient_role_status"] == "mismatch":
             ver_page, ver_excerpt = _first_evidence_info(evidence, "recipient_ruc", default_page)
             rows.append(
                 {
@@ -1239,7 +1319,7 @@ def _review_rows(
                 continue
             if not chk.get("consistent", True):
                 low_confidence = chk_name == "low_ocr_confidence"
-                page_located = chk_name in {"missing_description", "missing_issue_date", "missing_issuer_name", "rhe_retencion_check"}
+                page_located = chk_name in {"missing_description", "missing_issue_date", "missing_issuer_name", "rhe_retencion_check", "ambiguous_amount_format"}
                 if low_confidence or page_located or (chk_name == "arithmetic_total_reconciliation" and chk.get("method") == "observed_components"):
                     if low_confidence or page_located:
                         ver_page, ver_excerpt = f"pág. {chk['page']}", chk["excerpt"]
@@ -1255,6 +1335,7 @@ def _review_rows(
                                 "missing_issuer_name": "razon_social_emisor_ausente",
                                 "arithmetic_total_reconciliation": "revision_secundaria_importes",
                                 "rhe_retencion_check": "rhe_sin_retencion_ni_suspension",
+                                "ambiguous_amount_format": "importe_formato_ambiguo",
                             }[chk_name],
                             "priority": "media",
                             "detection_status": r["detection_status"],
@@ -1283,7 +1364,7 @@ def _review_rows(
                             "candidates_or_evidence": _json(chk),
                         }
                     )
-                elif chk_name == "igv_rate_check":
+                elif chk_name == "igv_rate_check" and (chk.get("consistent") is False or chk.get("needs_review")):
                     ver_page, ver_excerpt = _first_evidence_info(evidence, "igv", default_page)
                     rows.append(
                         {
@@ -1293,7 +1374,7 @@ def _review_rows(
                             "detection_status": r["detection_status"],
                             "identity_status": r["identity_status"],
                             "review_field": "igv",
-                            "observed_value": f"{chk.get('effective_rate')}%" if chk.get("effective_rate") is not None else "atipico",
+                            "observed_value": f"{chk.get('effective_rate')}%" if chk.get("effective_rate") is not None else str(chk.get("status") or "sin_tasa"),
                             "verification_page": ver_page,
                             "evidence_excerpt": ver_excerpt or r["detection_excerpt"],
                             "review_reason": chk.get("reason") or "Tasa efectiva de IGV fuera de rango esperado.",
@@ -1350,12 +1431,12 @@ def _review_rows(
                                     "candidates_or_evidence": _json(chk),
                                 }
                             )
-                elif chk_name == "sunat_qr_crosscheck" and chk.get("status") == "difiere":
+                elif chk_name == "sunat_qr_crosscheck" and chk.get("status") in {"difiere", "qr_no_vinculado"}:
                     discs = chk.get("discrepancies") or []
                     rows.append(
                         {
                             "document_id": r["document_id"],
-                            "finding_type": "discrepancia_cotejo_qr",
+                            "finding_type": "discrepancia_cotejo_qr" if chk.get("status") == "difiere" else "qr_no_vinculado",
                             "priority": "alta",
                             "detection_status": r["detection_status"],
                             "identity_status": r["identity_status"],
@@ -1363,7 +1444,10 @@ def _review_rows(
                             "observed_value": chk.get("qr_summary") or "difiere",
                             "verification_page": default_page,
                             "evidence_excerpt": r["identity_excerpt"] or r["detection_excerpt"],
-                            "review_reason": f"Cotejo contra código QR SUNAT difiere: {'; '.join(str(x) for x in discs)}",
+                            "review_reason": (
+                                f"Cotejo contra código QR SUNAT difiere: {'; '.join(str(x) for x in discs)}"
+                                if chk.get("status") == "difiere" else str(chk.get("reason") or "QR sin vínculo con lo leído.")
+                            ),
                             "display_location": r["display_location"],
                             "original_path": r["original_path"],
                             "container_chain_str": r["container_chain_str"],
@@ -1778,6 +1862,12 @@ def export_results(
     # Paso 4: preparar las filas de las otras hojas: notas, revisión e inventario.
     adjustments = _ajustes_vinculados_rows(documents, key_groups)
     review = _review_rows(documents, inventory, key_groups)
+    # Una sola fuente de verdad: un comprobante con al menos un hallazgo en la hoja
+    # revision tiene «Requiere revisión humana» verdadero, para que filtrar la hoja principal no lo oculte.
+    reviewed_ids = {row.get("document_id") for row in review if row.get("document_id") is not None}
+    for row in (*detected_rows, *adjustments):
+        if row.get("document_id") in reviewed_ids:
+            row["requires_human_review"] = True
     run = store.get_latest_run_metadata() or {}
     run_details = run.get("run_config") or {}
     pending_units = summary.pending_units if summary else run_details.get("pending_units") or []
@@ -1816,7 +1906,10 @@ def export_results(
     ]
     detail_rows = _detalle_items_rows(documents)
     exported_pdfs_count = sum(1 for doc in documents if doc.get("organized_path"))
-    mismatch_ruc_count = sum(1 for row in detected_rows if row.get("recipient_role_status") == "mismatch")
+    mismatch_ruc_count = sum(
+        1 for row in detected_rows
+        if row.get("recipient_role_status") == "mismatch" and not str(row.get("apto_credito_fiscal_preliminar") or "").startswith("No: posible venta propia")
+    )
     human_review_cdp_count = sum(1 for row in detected_rows if row.get("requires_human_review"))
     over_10mb_count = sum(
         1 for doc in documents
@@ -1836,6 +1929,9 @@ def export_results(
         ("CDP confirmados oficialmente", 0),
         ("Notas de crédito y débito", len(adjustments)),
         ("Hallazgos para revisar", len(review)),
+        ("Cotejo con QR SUNAT", _qr_summary(detected_rows)),
+        ("Consulta RUC (CIIU del emisor)", _consulta_ruc_summary(run_details)),
+        ("Padrón RUC: fecha de corte", _padron_cutoff_summary(run_details)),
         ("Canal oficial de validación", "Sin conexión a consulta oficial"),
         ("Alcance: validez de emisión CPE", "Esta herramienta NO consulta Clave SOL ni API CPE de SUNAT; estado_oficial siempre pendiente."),
         ("Alcance: padrón RUC (HABIDO/ACTIVO)", "El padrón local es estático a su fecha de corte; NO acredita condición a la fecha de emisión."),
